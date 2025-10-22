@@ -1,0 +1,21 @@
+Channels:
+  ChA:
+    channel: 9
+    dead_time: 0
+    delay: 0
+    trigger: 0.25
+  ChB:
+    channel: 18
+    dead_time: 0
+    delay: 0
+    trigger: 1.0
+  ChC:
+    channel: 5
+    dead_time: 100
+    delay: 0
+    trigger: 0.02
+  ChD:
+    channel: 18
+    dead_time: 0
+    delay: 0
+    trigger: 1.0
