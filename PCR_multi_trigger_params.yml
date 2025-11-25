@@ -10,7 +10,7 @@ turn_off_after_pcr:
 
 measurement_type: "filtered_pcr" # options are 'filtered_pcr' or 'dcr'
 
-fudge_factor: 0.90  # Adjust this factor to calibrate the ratio_on value
+fudge_factor: 0.9925  # Adjust this factor to calibrate the ratio_on value
 
 filtered_PCR: 
   trigger_levels:

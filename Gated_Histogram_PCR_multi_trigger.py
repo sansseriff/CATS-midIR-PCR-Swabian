@@ -278,10 +278,6 @@ class CoincidenceExample(QMainWindow):
 
         self.masked_hist_bins = 2
 
-        self.fudge_factor = 1.0
-
-
-
         # --- Added for robust connection ---
         self.source_port = '/dev/ttyUSB0' # Initial port
         self.possible_ports = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2'] # Ports to try
@@ -556,9 +552,6 @@ class CoincidenceExample(QMainWindow):
 
         self.ratio_on = (on_stop - on_start) / 1000
         self.ratio_off = (off_stop - off_start) / 1000
-
-        self.ratio_on = self.ratio_on * self.fudge_factor
-        self.ratio_off = self.ratio_off / self.fudge_factor
 
 
         # thermal source on
@@ -968,7 +961,9 @@ class CoincidenceExample(QMainWindow):
     def PCR(self):
         import yaml
         import os.path
+
         
+
         params_file = "./PCR_multi_trigger_params.yml"
         
         # Always load parameters from YAML file
@@ -981,8 +976,11 @@ class CoincidenceExample(QMainWindow):
                 params = yaml.safe_load(file)
             print("Parameters loaded from file.")
 
-            self.fudge_factor = params['fudge_factor']
-            
+            fudge_factor = params['fudge_factor']
+
+            self.ratio_on_fudged = self.ratio_on * fudge_factor
+            self.ratio_off_fudged = self.ratio_off / fudge_factor
+
             # Extract common parameters
             Start = params['voltage']['start']
             Stop = params['voltage']['stop']
@@ -1154,8 +1152,8 @@ class CoincidenceExample(QMainWindow):
                     clicks_on = cr_on.getData() 
                     clicks_off = cr_off.getData() 
 
-                    count = (clicks_on[0][0]/ (self.ratio_on*int_time_sec)) - (clicks_off[0][0]/ (self.ratio_off*int_time_sec)) # Calculate counts for this trigger level
-                    dark_count = (clicks_off[0][0]/ (self.ratio_off*int_time_sec))
+                    count = (clicks_on[0][0]/ (self.ratio_on_fudged*int_time_sec)) - (clicks_off[0][0]/ (self.ratio_off_fudged*int_time_sec)) # Calculate counts for this trigger level
+                    dark_count = (clicks_off[0][0]/ (self.ratio_off_fudged*int_time_sec))
 
                     Counts[j].append(count)
                     if Counts_off is not None:
