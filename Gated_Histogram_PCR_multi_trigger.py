@@ -52,6 +52,11 @@ class SIM928ControlDialog(QDialog):
         self.parent_window = parent
         self.setWindowTitle("SIM928 Voltage Source Control")
         self.setModal(True)
+        # Debounce timer for spinbox-driven voltage updates
+        self.debounce_timer = QTimer(self)
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.setInterval(100)  # 0.1 s debounce
+        self.debounce_timer.timeout.connect(self.set_voltage)
         self.setupUI()
         
     def setupUI(self):
@@ -64,11 +69,13 @@ class SIM928ControlDialog(QDialog):
         voltage_layout.addWidget(QLabel("Voltage:"))
         
         self.voltage_spinbox = QDoubleSpinBox()
-        self.voltage_spinbox.setRange(0.0, 5.0)
+        self.voltage_spinbox.setRange(0.0, 15.0)
         self.voltage_spinbox.setDecimals(3)
-        self.voltage_spinbox.setSingleStep(0.001)  # millivolt increments
+        self.voltage_spinbox.setSingleStep(0.10)  # millivolt increments
         self.voltage_spinbox.setSuffix(" V")
         self.voltage_spinbox.setValue(0.0)
+        # Debounced update when the value changes
+        self.voltage_spinbox.valueChanged.connect(self._on_voltage_spinbox_changed)
         voltage_layout.addWidget(self.voltage_spinbox)
         
         self.set_voltage_button = QPushButton("Set")
@@ -99,18 +106,31 @@ class SIM928ControlDialog(QDialog):
         layout.addWidget(close_button)
         
         self.setLayout(layout)
+
+    def _on_voltage_spinbox_changed(self, _value):
+        """Restart debounce timer on every change; set_voltage runs on timeout."""
+        # Restart the timer so set_voltage only fires after changes settle
+        self.debounce_timer.start()
         
     def set_voltage(self):
         """Set the voltage on the SIM928 source"""
+        # Prevent a pending debounce timeout from firing again after manual Set
+        try:
+            self.debounce_timer.stop()
+        except Exception:
+            pass
+
         voltage = self.voltage_spinbox.value()
         if self.parent_window:
             success = self.parent_window._set_source_voltage_robustly(voltage)
+            # Silent operation (no dialog). Log to console for traceability.
             if success:
-                QMessageBox.information(self, "Success", f"Voltage set to {voltage:.3f} V")
+                print(f"SIM928: Voltage set to {voltage:.3f} V")
             else:
-                QMessageBox.warning(self, "Error", f"Failed to set voltage to {voltage:.3f} V")
+                print(f"SIM928: Failed to set voltage to {voltage:.3f} V")
         else:
-            QMessageBox.warning(self, "Error", "No parent window available")
+            # No parent available; keep silent to avoid intrusive dialogs
+            print("SIM928: No parent window available to set voltage")
             
     def turn_on_source(self):
         """Turn on the SIM928 source"""
@@ -257,6 +277,8 @@ class CoincidenceExample(QMainWindow):
         self.ui.plotLayout.addWidget(self.canvas)
 
         self.masked_hist_bins = 2
+
+        self.fudge_factor = 1.0
 
 
 
@@ -516,23 +538,27 @@ class CoincidenceExample(QMainWindow):
         print(self.active_channels)
 
 
+        on_start = 30
+        on_stop = 270
+        off_start = 450
+        off_stop = 950
+
         # for us right now (oct 9 2024), self.active_channels[2] (3rd row) is 5, which is the snspd
         self.filtered = GatedChannel(self.tagger, self.active_channels[2], self.active_channels[0], -self.active_channels[0])
-        self.delay_1_start = DelayedChannel(self.tagger, self.active_channels[0], int(10e9))
-        self.delay_1_stop = DelayedChannel(self.tagger, self.active_channels[0], int(290e9))
+        self.delay_1_start = DelayedChannel(self.tagger, self.active_channels[0], int(on_start*1e9))
+        self.delay_1_stop = DelayedChannel(self.tagger, self.active_channels[0], int(on_stop*1e9))
 
-        # self.delay_1_start = DelayedChannel(self.tagger, self.active_channels[0], int(0e9))
-        # self.delay_1_stop = DelayedChannel(self.tagger, self.active_channels[0], int(800e9))
+        self.delay_2_start = DelayedChannel(self.tagger, self.active_channels[0], int(off_start*1e9))
 
-        self.delay_2_start = DelayedChannel(self.tagger, self.active_channels[0], int(450e9))
-        
-        self.delay_2_stop = DelayedChannel(self.tagger, self.active_channels[0], int(950e9))
+        self.delay_2_stop = DelayedChannel(self.tagger, self.active_channels[0], int(off_stop*1e9))
         # self.delay_2_stop = DelayedChannel(self.tagger, self.active_channels[0], int(800e9))
 
 
-        self.ratio_on = (290 - 10) / 1000
-        self.ratio_off = (950 - 450) / 1000
-        
+        self.ratio_on = (on_stop - on_start) / 1000
+        self.ratio_off = (off_stop - off_start) / 1000
+
+        self.ratio_on = self.ratio_on * self.fudge_factor
+        self.ratio_off = self.ratio_off / self.fudge_factor
 
 
         # thermal source on
@@ -954,6 +980,8 @@ class CoincidenceExample(QMainWindow):
             with open(params_file, 'r') as file:
                 params = yaml.safe_load(file)
             print("Parameters loaded from file.")
+
+            self.fudge_factor = params['fudge_factor']
             
             # Extract common parameters
             Start = params['voltage']['start']
