@@ -678,6 +678,23 @@ class CoincidenceExample(QMainWindow):
         self.save_requested = False
         self.save_filename = None
 
+        self.load_params()
+
+
+    def load_params(self):
+        """Load parameters from PCR_multi_trigger_params.yml"""
+        params_file = "./PCR_multi_trigger_params.yml"
+        if os.path.exists(params_file):
+            try:
+                with open(params_file, 'r') as file:
+                    self.params = yaml.safe_load(file)
+                print(f"Parameters loaded from {params_file}")
+            except Exception as e:
+                print(f"Error loading parameters: {e}")
+                self.params = {}
+        else:
+            print(f"Warning: {params_file} not found.")
+            self.params = {}
 
     def fromFile(self):
         # self.ent = False
@@ -863,10 +880,18 @@ class CoincidenceExample(QMainWindow):
         print(self.active_channels)
 
 
-        on_start = 30
-        on_stop = 270
-        off_start = 450
-        off_stop = 950
+        # Load gating delays from params based on mode
+        mode = self.params.get('mode', 'thermal_source')
+        delays = self.params.get('gating_delays', {}).get(mode, {
+            'on_start': 30, 'on_stop': 270, 'off_start': 450, 'off_stop': 950
+        })
+        
+        on_start = delays.get('on_start', 30)
+        on_stop = delays.get('on_stop', 270)
+        off_start = delays.get('off_start', 450)
+        off_stop = delays.get('off_stop', 950)
+        
+        print(f"Mode: {mode}, Delays (ms): on=[{on_start}, {on_stop}], off=[{off_start}, {off_stop}]")
 
         # for us right now (oct 9 2024), self.active_channels[2] (3rd row) is 5, which is the snspd
         self.filtered = GatedChannel(self.tagger, self.active_channels[2], self.active_channels[0], -self.active_channels[0])
@@ -1301,18 +1326,34 @@ class CoincidenceExample(QMainWindow):
     def PCR(self):
         """Start the PCR measurement in a background thread with cancel support."""
 
-        params_file = "./PCR_multi_trigger_params.yml"
+        # Ask user for CSV filename
+        filename, _ = QFileDialog().getSaveFileName(
+            parent=self,
+            caption='Save PCR Curve Data',
+            directory='PCR_Curve_Data.csv',
+            filter='CSV Files (*.csv);;All Files (*)',
+            options=QFileDialog.DontUseNativeDialog
+        )
 
-        # Load parameters (quick, OK in GUI thread)
-        if not os.path.exists(params_file):
-            print(f"Error: Parameter file '{params_file}' not found.")
+        if not filename:
+            print("Save operation cancelled.")
+            return
+
+        if not filename.lower().endswith('.csv'):
+            filename += '.csv'
+
+        png_filename = filename[:-4] + '.png'
+
+        # Reload params and update hardware settings/gating before starting
+        self.load_params()
+        self.updateMeasurements()
+        
+        params = self.params
+        if not params:
+            print("Error: No parameters loaded. Check PCR_multi_trigger_params.yml")
             return
 
         try:
-            with open(params_file, 'r') as file:
-                params = yaml.safe_load(file)
-            print("Parameters loaded from file.")
-
             fudge_factor = params['fudge_factor']
             self.ratio_on_fudged = self.ratio_on * fudge_factor
             self.ratio_off_fudged = self.ratio_off / fudge_factor
@@ -1342,29 +1383,11 @@ class CoincidenceExample(QMainWindow):
                 print(f"Error: Unknown measurement type '{measurement_type}'. Must be 'filtered_pcr' or 'dcr'.")
                 return
         except (yaml.YAMLError, KeyError, TypeError) as e:
-            print(f"Error loading or parsing parameters from '{params_file}': {e}")
+            print(f"Error loading or parsing parameters: {e}")
             return
         except Exception as e:
             print(f"An unexpected error occurred while loading parameters: {e}")
             return
-
-        # Ask user for CSV filename
-        filename, _ = QFileDialog().getSaveFileName(
-            parent=self,
-            caption='Save PCR Curve Data',
-            directory='PCR_Curve_Data.csv',
-            filter='CSV Files (*.csv);;All Files (*)',
-            options=QFileDialog.DontUseNativeDialog
-        )
-
-        if not filename:
-            print("Save operation cancelled.")
-            return
-
-        if not filename.lower().endswith('.csv'):
-            filename += '.csv'
-
-        png_filename = filename[:-4] + '.png'
 
         # Prepare worker and thread
         try:
