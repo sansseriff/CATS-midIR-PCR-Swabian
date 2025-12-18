@@ -2,8 +2,10 @@
 
 # PySide2 for the UI
 from PySide2.QtWidgets import QMainWindow, QApplication, QFileDialog, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QDoubleSpinBox, QLabel, QGroupBox, QMessageBox
-from PySide2.QtCore import QTimer
+from PySide2.QtCore import QTimer, QThread, Signal, QObject
 from PySide2.QtGui import QPalette, QColor
+
+from snsphd.viz import phd_grid_style
 
 from snspd_measure.inst.sim900 import sim928
 
@@ -14,6 +16,8 @@ from client_keysightE36312A import ClientKeysightE36312A
 # matplotlib for the plots, including its Qt backend
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
+from matplotlib import cm
 import time
 # to generate new UI file: pyside2-uic CoincidenceExampleWindow_XXX.ui > CoincidenceExampleWindow_mx.py
 # Please use the QtDesigner to edit the ui interface file
@@ -34,6 +38,7 @@ import yaml
 # all required TimeTagger dependencies
 from TimeTagger import Coincidences, Histogram2D, Counter, Correlation, createTimeTagger, freeTimeTagger, Histogram, FileWriter, FileReader, TT_CHANNEL_FALLING_EDGES, Resolution, DelayedChannel, GatedChannel, Countrate, CHANNEL_UNUSED
 from time import sleep
+import time
 
 import json
 import csv
@@ -43,6 +48,324 @@ import serial # Import serial for exception handling
 import termios # Import termios for catching specific OS error
 
 # from awgClient import AWGClient
+
+
+def compute_pcr_colors(num_lines, cmap_name='plasma', crop_start=0.1, crop_end=0.9):
+    """Return a list of RGBA colors for PCR plots.
+
+    Colors are sampled from a cropped segment of the specified colormap
+    (default "plasma") using linear interpolation so that the first and
+    last lines are not too dark or too bright.
+
+    Parameters
+    ----------
+    num_lines : int
+        Number of colors required (e.g. number of trigger levels).
+    cmap_name : str
+        Name of the Matplotlib colormap to use.
+    crop_start : float
+        Start of the colormap segment (0–1) to use.
+    crop_end : float
+        End of the colormap segment (0–1) to use.
+    """
+    if num_lines <= 0:
+        return []
+
+    crop_start = max(0.0, min(1.0, crop_start))
+    crop_end = max(0.0, min(1.0, crop_end))
+    if crop_end < crop_start:
+        crop_start, crop_end = crop_end, crop_start
+
+    cmap = cm.get_cmap(cmap_name)
+
+    if num_lines == 1:
+        t_values = [0.5]
+    else:
+        t_values = numpy.linspace(crop_start, crop_end, num_lines)
+
+    return [cmap(t) for t in t_values]
+
+
+class PCRWorker(QObject):
+    """Background worker that runs the long PCR scan in a QThread.
+
+    It cooperatively checks for cancellation only between bias points,
+    ensuring that the current bias finishes all trigger levels before
+    stopping. It returns the collected data to the GUI for saving.
+    """
+
+    # Can emit either log strings or structured dicts with
+    # partial data for live plotting.
+    progress = Signal(object)
+    finished_ok = Signal(dict)
+    error = Signal(str)
+    cancel_ack = Signal()
+
+    def __init__(self, tagger, params, filename, png_filename,
+                 ratio_on_fudged, ratio_off_fudged,
+                 filtered_on_channel, filtered_off_channel,
+                 active_snspd_channel,
+                 set_bias_fn,
+                 channelC,
+                 parent=None):
+        super(PCRWorker, self).__init__(parent)
+        self.tagger = tagger
+        self.params = params
+        self.filename = filename
+        self.png_filename = png_filename
+        self.ratio_on_fudged = ratio_on_fudged
+        self.ratio_off_fudged = ratio_off_fudged
+        self.filtered_on_channel = filtered_on_channel
+        self.filtered_off_channel = filtered_off_channel
+        self.active_snspd_channel = active_snspd_channel
+
+        # Callable that sets the SIM928 bias voltage for a given offset,
+        # mirroring _set_source_voltage_robustly from the GUI thread.
+        self.set_bias_fn = set_bias_fn
+        # Channel used for trigger level sweeps (was ui.channelC in original PCR).
+        self.channelC = channelC
+
+        self._cancel_requested = False
+        self._cancel_ack_emitted = False
+
+    def request_cancel(self):
+        """Mark that a cancel was requested.
+
+        The worker will only actually stop after finishing the current
+        bias point (i.e. after the inner trigger-level loop).
+        """
+        self._cancel_requested = True
+
+    def _check_cancel_after_bias(self):
+        """Check for cancellation between bias points.
+
+        Emits cancel_ack once, then instructs caller to stop looping
+        by returning True.
+        """
+        if self._cancel_requested:
+            if not self._cancel_ack_emitted:
+                self._cancel_ack_emitted = True
+                self.cancel_ack.emit()
+                self.progress.emit("Cancel requested – finishing current bias and saving data…")
+            return True
+        return False
+
+    def run(self):
+        """Main worker entry point executed in the background thread."""
+        try:
+            import numpy
+            import matplotlib.pyplot as plt
+            import csv
+            import time
+
+            params = self.params
+            fudge_factor = params['fudge_factor']
+
+            # Extract common parameters
+            Start = params['voltage']['start']
+            Stop = params['voltage']['stop']
+            Step = params['voltage']['step']
+            int_time_sec = params['integration_time']
+            measurement_type = params.get('measurement_type', 'filtered_pcr').lower()
+
+            # Extract measurement-specific parameters
+            if measurement_type == 'filtered_pcr':
+                trigger_levels = params['filtered_PCR']['trigger_levels']
+                num_trigger_levels = len(trigger_levels)
+            elif measurement_type == 'dcr':
+                if 'trigger_levels' in params['DCR']:
+                    trigger_levels = params['DCR']['trigger_levels']
+                else:
+                    trigger_level = params['DCR']['trigger_level']
+                    trigger_levels = [str(trigger_level)]
+                num_trigger_levels = len(trigger_levels)
+            else:
+                self.error.emit(f"Unknown measurement type '{measurement_type}'")
+                return
+
+            # Voltage offsets
+            offset = numpy.arange(Start, Stop + Step, Step)
+            if not numpy.isclose(offset[-1], Stop):
+                offset = numpy.append(offset, Stop)
+
+            I_det = []
+            for v_offset in offset:
+                I_det.append(((v_offset / 1.02e6) * 1e6).round(4))
+            I_b = numpy.asarray(I_det, dtype='float')
+
+            int_time = int(float(int_time_sec) * 1e12)
+            bin_duration = 0.1
+            if measurement_type == 'dcr':
+                num_bins = int(int_time_sec / bin_duration)
+                bin_time_ps = int(bin_duration * 1e12)
+            else:
+                num_bins = 1
+                bin_time_ps = int_time
+
+            Counts = [[] for _ in range(num_trigger_levels)]
+            Counts_off = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
+
+            x_vals = []
+
+            # --- Simple ETA estimation ---
+            total_biases = len(I_b)
+            total_triggers = total_biases * num_trigger_levels
+            # Integration time per trigger plus a small overhead (s)
+            per_trigger_est = float(int_time_sec) + 0.3
+            total_estimated = max(1.0, total_triggers * per_trigger_est)
+            start_time = time.time()
+            eta_time = start_time + total_estimated
+
+            self.progress.emit(
+                "Starting PCR measurement… Estimated duration: "
+                f"{total_estimated/60:.1f} min (ETA {time.strftime('%H:%M:%S', time.localtime(eta_time))})"
+            )
+
+            # Outer loop over bias points
+            for i in range(len(I_b)):
+                # Match original PCR(): set SIM928 bias for this offset
+                set_voltage_success = self.set_bias_fn(offset[i])
+                if not set_voltage_success:
+                    # Mirror original behavior: append NaNs/placeholders and skip
+                    x_vals.append(I_b[i])
+                    for j in range(num_trigger_levels):
+                        if measurement_type == 'filtered_pcr':
+                            Counts[j].append(numpy.nan)
+                            if Counts_off is not None:
+                                Counts_off[j].append(numpy.nan)
+                        else:
+                            Counts[j].append(numpy.full(num_bins, numpy.nan))
+                    continue
+                if self._cancel_requested and not self._cancel_ack_emitted:
+                    # Note: we still run this bias fully; cancel only affects
+                    # whether we continue to the *next* bias.
+                    self.cancel_ack.emit()
+                    self._cancel_ack_emitted = True
+                    self.progress.emit("Cancel requested – finishing current bias…")
+
+                current_bias_ua = I_b[i]
+                x_vals.append(current_bias_ua)
+                self.progress.emit(f"Bias index {i+1}/{len(I_b)}, I = {current_bias_ua:.3f} µA")
+
+                # Configure counters for this bias
+                if measurement_type == 'filtered_pcr':
+                    cr_on = Counter(self.tagger, [self.filtered_on_channel], binwidth=int_time, n_values=1)
+                    cr_off = Counter(self.tagger, [self.filtered_off_channel], binwidth=int_time, n_values=1)
+                    cr_dcr = None
+                else:
+                    cr_dcr = Counter(self.tagger, [self.active_snspd_channel], binwidth=bin_time_ps, n_values=num_bins)
+                    cr_on = None
+                    cr_off = None
+
+                # Inner loop over trigger levels – always complete
+                for j, trigger_level in enumerate(trigger_levels):
+                    trigger_level_float = float(trigger_level)
+                    # Match original PCR(): sweep trigger on channel C
+                    self.tagger.setTriggerLevel(self.channelC, trigger_level_float)
+                    self.progress.emit(f"  Trigger {j+1}/{num_trigger_levels}: {trigger_level_float:.3f} V")
+
+                    time.sleep(0.2)
+
+                    if measurement_type == 'filtered_pcr' and cr_on is not None and cr_off is not None:
+                        cr_on.startFor(int_time, clear=True)
+                        cr_off.startFor(int_time, clear=True)
+                        cr_on.waitUntilFinished()
+                        cr_off.waitUntilFinished()
+
+                        clicks_on = cr_on.getData()
+                        clicks_off = cr_off.getData()
+
+                        count = (clicks_on[0][0] / (self.ratio_on_fudged * int_time_sec)) - (clicks_off[0][0] / (self.ratio_off_fudged * int_time_sec))
+                        dark_count = (clicks_off[0][0] / (self.ratio_off_fudged * int_time_sec))
+
+                        Counts[j].append(count)
+                        if Counts_off is not None:
+                            Counts_off[j].append(dark_count)
+                        self.progress.emit(f"    Signal: {count:.3f}, Dark: {dark_count:.3f}")
+
+                    elif measurement_type == 'dcr' and cr_dcr is not None:
+                        cr_dcr.startFor(int_time, clear=True)
+                        cr_dcr.waitUntilFinished()
+
+                        clicks_data = cr_dcr.getData()
+                        bin_counts = clicks_data[0]
+                        bin_counts_per_sec = bin_counts / bin_duration
+                        Counts[j].append(bin_counts_per_sec)
+                        avg_count = numpy.mean(bin_counts_per_sec)
+                        self.progress.emit(f"    DCR avg: {avg_count:.2f} Hz")
+
+                    # Update ETA/progress after each trigger
+                    completed_triggers = i * num_trigger_levels + (j + 1)
+                    elapsed = max(0.0, time.time() - start_time)
+                    fraction = min(1.0, completed_triggers / float(total_triggers)) if total_triggers > 0 else 1.0
+                    remaining_est = max(0.0, total_estimated * (1.0 - fraction))
+                    self.progress.emit(
+                        f"Elapsed {elapsed/60:.1f} min, est. remaining {remaining_est/60:.1f} min"
+                    )
+
+                # After finishing this bias, emit a structured
+                # snapshot so the GUI can update the live plot.
+                self.progress.emit({
+                    'type': 'update',
+                    'I_b': I_b,
+                    'x_vals': list(x_vals),
+                    'Counts': Counts,
+                    'Counts_off': Counts_off,
+                    'measurement_type': measurement_type,
+                    'trigger_levels': trigger_levels,
+                })
+
+                # Respect cancel between bias points
+                if self._check_cancel_after_bias():
+                    break
+
+            # Package data and let the GUI do CSV + shutdown
+            result = {
+                'I_b': I_b,
+                'x_vals': x_vals,
+                'Counts': Counts,
+                'Counts_off': Counts_off,
+                'trigger_levels': trigger_levels,
+                'measurement_type': measurement_type,
+                'num_bins': num_bins,
+                'bin_duration': bin_duration,
+                'int_time_sec': int_time_sec,
+                'params': params,
+                'filename': self.filename,
+            }
+            self.finished_ok.emit(result)
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.error.emit(f"PCR worker error: {e}\n{tb}")
+
+
+class PCRProgressDialog(QDialog):
+    """Simple progress dialog with a Cancel button for PCR scans."""
+
+    cancel_requested = Signal()
+
+    def __init__(self, parent=None):
+        super(PCRProgressDialog, self).__init__(parent)
+        self.setWindowTitle("PCR Measurement")
+
+        layout = QVBoxLayout(self)
+        self.label = QLabel("Running PCR curve measurement…")
+        layout.addWidget(self.label)
+
+        button_layout = QHBoxLayout()
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+
+    def set_status(self, text: str):
+        self.label.setText(text)
+
+    def set_finishing_up(self):
+        self.label.setText("Finishing up current bias point…")
+        self.cancel_button.setEnabled(False)
 
 class SIM928ControlDialog(QDialog):
     """Modal dialog for controlling the SIM928 voltage source"""
@@ -267,16 +590,22 @@ class CoincidenceExample(QMainWindow):
             self.updateMeasurements)
         self.ui.correlationBins.valueChanged.connect(self.updateMeasurements)
 
-        # Create the matplotlib figure with its subplots for the counter and correlation
+        # Create the matplotlib figure with its subplots for the counter and PCR
+        # Use a 1:3 height ratio so the PCR plot is larger.
         self.fig = Figure()
-        self.counterAxis = self.fig.add_subplot(211)
-        self.correlationAxis = self.fig.add_subplot(212)
+        gs = GridSpec(2, 1, height_ratios=[1, 3], figure=self.fig)
+        self.counterAxis = self.fig.add_subplot(gs[0, 0])
+        self.correlationAxis = self.fig.add_subplot(gs[1, 0])
         self.canvas = FigureCanvasQTAgg(self.fig)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         self.ui.plotLayout.addWidget(self.toolbar)
         self.ui.plotLayout.addWidget(self.canvas)
 
         self.masked_hist_bins = 2
+
+
+        # phd_style(jupyterStyle=True, data_width=1)
+        phd_grid_style(grid=True)
 
         # --- Added for robust connection ---
         self.source_port = '/dev/ttyUSB0' # Initial port
@@ -577,15 +906,26 @@ class CoincidenceExample(QMainWindow):
         self.tagger.sync()
 
         # Create the measurement plots
-        self.counterAxis.clear() # this is a matplotlib figure
+        self.counterAxis.clear()  # this is a matplotlib figure
+
+        # Use the shared colormap helper to color each count-rate trace
+        count_rate_colors = compute_pcr_colors(
+            len(self.active_channels) + 1, crop_start=0.2, crop_end=0.7
+        )
+
+        # Plot all count-rate traces; this returns a list of Line2D objects
         self.plt_counter = self.counterAxis.plot(
             self.counter.getIndex() * 1e-12,
-            self.counter.getData().T * self.getCouterNormalizationFactor()
+            self.counter.getData().T * self.getCouterNormalizationFactor(),
         )
+
+        # Assign a distinct color to each line
+        for line, color in zip(self.plt_counter, count_rate_colors):
+            line.set_color(color)
         self.counterAxis.set_xlabel('time (s)')
-        self.counterAxis.set_ylabel('count rate (kEvents/s)')
-        self.counterAxis.set_title('Count rate')
-        self.counterAxis.legend(['A', 'B', 'C', 'D','coincidences'])
+        self.counterAxis.set_ylabel('Rate (kHz)')
+        # self.counterAxis.set_title('Count rate')
+        # self.counterAxis.legend(['A', 'B', 'C', 'D','coincidences'])
         self.counterAxis.grid(True)
 
         self.correlationAxis.clear()
@@ -959,351 +1299,343 @@ class CoincidenceExample(QMainWindow):
             print(f"Error in instrument shutdown: {e}")
 
     def PCR(self):
-        import yaml
-        import os.path
-
-        
+        """Start the PCR measurement in a background thread with cancel support."""
 
         params_file = "./PCR_multi_trigger_params.yml"
-        
-        # Always load parameters from YAML file
+
+        # Load parameters (quick, OK in GUI thread)
         if not os.path.exists(params_file):
             print(f"Error: Parameter file '{params_file}' not found.")
-            return # Exit if file doesn't exist
-            
+            return
+
         try:
             with open(params_file, 'r') as file:
                 params = yaml.safe_load(file)
             print("Parameters loaded from file.")
 
             fudge_factor = params['fudge_factor']
-
             self.ratio_on_fudged = self.ratio_on * fudge_factor
             self.ratio_off_fudged = self.ratio_off / fudge_factor
 
-            # Extract common parameters
-            Start = params['voltage']['start']
-            Stop = params['voltage']['stop']
-            Step = params['voltage']['step']
-            int_time_sec = params['integration_time']
             measurement_type = params.get('measurement_type', 'filtered_pcr').lower()
-            
             print(f"Measurement type: {measurement_type}")
-            
-            # Extract measurement-specific parameters
+
             if measurement_type == 'filtered_pcr':
                 trigger_levels = params['filtered_PCR']['trigger_levels']
                 if not isinstance(trigger_levels, list) or not trigger_levels:
                     print("Error: 'trigger_levels' in filtered_PCR YAML must be a non-empty list.")
                     return
-                num_trigger_levels = len(trigger_levels)
-                print(f"Using {num_trigger_levels} trigger levels: {trigger_levels}")
             elif measurement_type == 'dcr':
-                # Support both old single trigger_level and new trigger_levels list
                 if 'trigger_levels' in params['DCR']:
                     trigger_levels = params['DCR']['trigger_levels']
                     if not isinstance(trigger_levels, list) or not trigger_levels:
                         print("Error: 'trigger_levels' in DCR YAML must be a non-empty list.")
                         return
                 elif 'trigger_level' in params['DCR']:
-                    # Backward compatibility with single trigger level
                     trigger_level = params['DCR']['trigger_level']
                     trigger_levels = [str(trigger_level)]
                     print("Using single DCR trigger level (backward compatibility mode)")
                 else:
                     print("Error: DCR section must contain either 'trigger_levels' (list) or 'trigger_level' (single value).")
                     return
-                
-                num_trigger_levels = len(trigger_levels)
-                print(f"Using {num_trigger_levels} DCR trigger levels: {trigger_levels}")
             else:
                 print(f"Error: Unknown measurement type '{measurement_type}'. Must be 'filtered_pcr' or 'dcr'.")
                 return
-
         except (yaml.YAMLError, KeyError, TypeError) as e:
             print(f"Error loading or parsing parameters from '{params_file}': {e}")
-            return # Exit on error
+            return
         except Exception as e:
-             print(f"An unexpected error occurred while loading parameters: {e}")
-             return
+            print(f"An unexpected error occurred while loading parameters: {e}")
+            return
 
-        # Get save location first using file dialog
+        # Ask user for CSV filename
         filename, _ = QFileDialog().getSaveFileName(
             parent=self,
             caption='Save PCR Curve Data',
-            directory='PCR_Curve_Data.csv',  # default name
+            directory='PCR_Curve_Data.csv',
             filter='CSV Files (*.csv);;All Files (*)',
             options=QFileDialog.DontUseNativeDialog
         )
-        
-        # If user cancels, exit the function
+
         if not filename:
             print("Save operation cancelled.")
             return
-        
-        # Ensure we have a .csv extension for the CSV file
+
         if not filename.lower().endswith('.csv'):
             filename += '.csv'
-        
-        # Create the base filename for the PNG (remove .csv and we'll add .png later)
-        png_filename = filename[:-4] if filename.lower().endswith('.csv') else filename
-        png_filename += '.png'
-        
-        # V_pp = 0.090  # in V # This seems unused, consider removing if not needed elsewhere
-        offset = numpy.arange(Start, Stop + Step, Step) # Corrected range to include Stop properly
-        # Ensure Stop is included if the step doesn't divide the range perfectly
-        if not numpy.isclose(offset[-1], Stop):
-             offset = numpy.append(offset, Stop)
 
-        I_det = []
-        int_time = int(float(int_time_sec)*1e12)
-        print("Integration time (ps): ", int_time)
-        
-        # For DCR measurements, calculate number of bins (0.1 second each)
-        bin_duration = 0.1  # 0.1 second per bin (used for all measurements)
-        if measurement_type == 'dcr':
-            num_bins = int(int_time_sec / bin_duration)  # Total number of bins
-            bin_time_ps = int(bin_duration * 1e12)  # 0.1 second in picoseconds
-            print(f"DCR measurement: {num_bins} bins of {bin_duration} seconds each")
-        else:
-            num_bins = 1
-            bin_time_ps = int_time
-        
-        Counts = [[] for _ in range(num_trigger_levels)]  # Store counts for each trigger level
-        Counts_off = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None # Store dark counts for filtered PCR
-        
-        # Use matplotlib's default color cycle
-        prop_cycle = plt.rcParams['axes.prop_cycle']
-        colors = prop_cycle.by_key()['color']
+        png_filename = filename[:-4] + '.png'
 
-        fig, ax = plt.subplots() # Use ax for plotting
-        x_vals = []
-        print(f"Estimated completion time (minutes): {round((int_time_sec * num_trigger_levels + 0.2 * num_trigger_levels)/60 * len(offset), 2)}") # Adjusted estimate
-        
-        # Determining Bias at the Detector
-        for v_offset in offset:
-            # Assuming 1.02 MOhm series resistance for current calculation
-            # Verify this calculation is correct for your setup
-            I_det.append(((v_offset / 1.02e6) * 1e6).round(4))  # in uA
-    
-        I_b = numpy.asarray(I_det, dtype='float')
-    
-        for i in range(len(I_b)): # Iterate through bias currents/voltages
-            # --- Set Voltage Robustly ---
-            set_voltage_success = self._set_source_voltage_robustly(offset[i])
-            # --- End Set Voltage Robustly ---
-
-            # If setting voltage failed after retries, skip the rest of the loop for this bias
-            if not set_voltage_success:
-                print(f"Skipping measurements for bias voltage index {i} (Voltage: {offset[i]:.3f} V) due to connection issues.")
-                # Ensure lists have consistent lengths if skipping, e.g., append NaN or skip appending later
-                # For simplicity here, we just continue to the next bias voltage.
-                # Depending on plotting logic, you might need placeholder values.
-
-                # Append NaN or placeholder to keep plot arrays aligned
-                x_vals.append(I_b[i]) # Keep x-axis value
-                for j in range(num_trigger_levels):
-                    if measurement_type == 'filtered_pcr':
-                        Counts[j].append(numpy.nan) # Use NaN for missing data
-                        if Counts_off is not None:
-                            Counts_off[j].append(numpy.nan)
-                    else:  # dcr measurement
-                        # For DCR, append an array of NaN values to match the expected structure
-                        Counts[j].append(numpy.full(num_bins, numpy.nan))
-
-                continue # Skip to the next value of i in the outer loop
-
-            current_bias_ua = I_b[i]
-            x_vals.append(current_bias_ua) # Append current bias value for plotting
-            # print(f"\nBias: {current_bias_ua} uA") # Simplified print
-
-            # Set up measurement channels based on measurement type
-            if measurement_type == 'filtered_pcr':
-                cr_on = Counter(self.tagger, [self.filtered_on.getChannel()], binwidth=int_time, n_values=1)
-                cr_off = Counter(self.tagger, [self.filtered_off.getChannel()], binwidth=int_time, n_values=1)
-                cr_dcr = None
-            else:  # dcr measurement
-                cr_dcr = Counter(self.tagger, [self.active_channels[2]], binwidth=bin_time_ps, n_values=num_bins)
-                cr_on = None
-                cr_off = None
-
-            for j, trigger_level in enumerate(trigger_levels): # Iterate through trigger levels
-                trigger_level_float = float(trigger_level) # Ensure it's float
-                self.tagger.setTriggerLevel(self.ui.channelC.value(), trigger_level_float)
-                # Optional: Add a small delay after setting trigger level if needed
-                # time.sleep(0.05)
-                # Verify trigger level was set (optional)
-                # actual_trigger = self.tagger.getTriggerLevel(self.ui.channelC.value())
-                # print(f"  Trigger Level {j+1}/{num_trigger_levels}: Set={trigger_level_float:.3f} V")#, Actual={actual_trigger:.3f} V")
-                print(f"  Measuring Trigger Level: {trigger_level_float:.3f} V")
-
-                time.sleep(0.2) # Delay before measurement
-    
-                if measurement_type == 'filtered_pcr' and cr_on is not None and cr_off is not None:
-                    # Filtered PCR measurement
-                    # Start measurements
-                    cr_on.startFor(int_time, clear=True)
-                    cr_off.startFor(int_time, clear=True)
-                    
-                    # Wait for measurements to complete
-                    cr_on.waitUntilFinished()
-                    cr_off.waitUntilFinished()
-        
-                    clicks_on = cr_on.getData() 
-                    clicks_off = cr_off.getData() 
-
-                    count = (clicks_on[0][0]/ (self.ratio_on_fudged*int_time_sec)) - (clicks_off[0][0]/ (self.ratio_off_fudged*int_time_sec)) # Calculate counts for this trigger level
-                    dark_count = (clicks_off[0][0]/ (self.ratio_off_fudged*int_time_sec))
-
-                    Counts[j].append(count)
-                    if Counts_off is not None:
-                        Counts_off[j].append(dark_count) # Store dark counts for this trigger level
-                    print(f"    Signal Counts: {count}, Dark Counts: {dark_count}")
-                    
-                elif measurement_type == 'dcr' and cr_dcr is not None:
-                    # DCR measurement - direct count on active_channels[2] with multiple bins
-                    cr_dcr.startFor(int_time, clear=True)
-                    cr_dcr.waitUntilFinished()
-                    
-                    clicks_data = cr_dcr.getData()  # This returns a 2D array: [channels][bins]
-                    bin_counts = clicks_data[0]  # Get data for first (and only) channel
-                    
-                    # Convert to counts per second for each bin
-                    bin_counts_per_sec = bin_counts / bin_duration
-                    
-                    # Store the entire array of bin counts
-                    Counts[j].append(bin_counts_per_sec)
-                    
-                    # Calculate average for printing
-                    avg_count = numpy.mean(bin_counts_per_sec)
-                    print(f"    DCR Counts (avg): {avg_count:.2f} Hz, {num_bins} bins")
-
-            # --- Plotting Update ---
-            ax.clear() # Clear previous plot data for redraw
-            for j in range(num_trigger_levels):
-                color = colors[j % len(colors)] # Cycle through colors
-                
-                if measurement_type == 'filtered_pcr':
-                    trigger_label = f'TL {j+1}: {trigger_levels[j]}'
-                    dark_label = f'Dark TL {j+1}'
-                    
-                    # Filter out NaN values for plotting lines/scatter
-                    valid_indices = ~numpy.isnan(Counts[j])
-                    valid_x = numpy.array(x_vals)[valid_indices]
-                    valid_counts = numpy.array(Counts[j])[valid_indices]
-                    if Counts_off is not None:
-                        valid_counts_off = numpy.array(Counts_off[j])[valid_indices]
-                    else:
-                        valid_counts_off = numpy.array([])
-
-                    # Plot signal counts (scatter and line) - only plot valid points
-                    ax.scatter(valid_x, valid_counts, color=color, s=10, label=trigger_label if i == len(I_b) - 1 else None) # Label only on last iteration
-                    ax.plot(valid_x, valid_counts, color=color)
-
-                    # Plot dark counts (line, dashed) - only plot valid points
-                    if len(valid_counts_off) > 0:
-                        ax.plot(valid_x, valid_counts_off, color=color, linestyle='--', label=dark_label if i == len(I_b) - 1 else None) # Label only on last iteration
-                    
-                    ax.set_title("Gated PCR Curve")
-                    
-                else:  # dcr measurement
-                    dcr_label = f'DCR TL: {trigger_levels[j]}'
-                    
-                    # For DCR, Counts[j] contains arrays, so we need to calculate averages for plotting
-                    avg_counts = []
-                    for count_array in Counts[j]:
-                        if isinstance(count_array, numpy.ndarray):
-                            avg_counts.append(numpy.mean(count_array))
-                        else:
-                            avg_counts.append(count_array if not numpy.isnan(count_array) else numpy.nan)
-                    
-                    # Filter out NaN values for plotting
-                    valid_indices = ~numpy.isnan(avg_counts)
-                    valid_x = numpy.array(x_vals)[valid_indices]
-                    valid_avg_counts = numpy.array(avg_counts)[valid_indices]
-
-                    # Plot DCR counts (using averages)
-                    ax.scatter(valid_x, valid_avg_counts, color=color, s=10, label=dcr_label if i == len(I_b) - 1 else None)
-                    ax.plot(valid_x, valid_avg_counts, color=color)
-
-                    ax.set_title("DCR Curve")
-            
-            ax.set_xlabel("Bias Current (uA)")
-            ax.set_ylabel("Counts")
-            ax.grid(True) # Add grid
-            plt.draw()
-            plt.pause(0.1) # Shorter pause
-
-        ax.legend(loc='best')
-
-        # Save the final plot figure as PNG
+        # Prepare worker and thread
         try:
-            plt.savefig(png_filename, dpi=300, bbox_inches='tight')
-            print(f"Plot saved as: {png_filename}")
+            filtered_on_channel = self.filtered_on.getChannel()
+            filtered_off_channel = self.filtered_off.getChannel()
+            active_snspd_channel = self.active_channels[2]
         except Exception as e:
-            print(f"Error saving plot: {e}")
+            print(f"Error preparing PCR worker channels: {e}")
+            return
 
-        # Show the final plot (optional, can be blocking)
-        # plt.show()
-    
-        print(f'Finished {measurement_type.upper()} Curve Measurement.')
-    
-        # --- CSV Writing Update ---
+        self._pcr_thread = QThread(self)
+        self._pcr_worker = PCRWorker(
+            tagger=self.tagger,
+            params=params,
+            filename=filename,
+            png_filename=png_filename,
+            ratio_on_fudged=self.ratio_on_fudged,
+            ratio_off_fudged=self.ratio_off_fudged,
+            filtered_on_channel=filtered_on_channel,
+            filtered_off_channel=filtered_off_channel,
+            active_snspd_channel=active_snspd_channel,
+            set_bias_fn=lambda v: self._set_source_voltage_robustly(v),
+            channelC=self.ui.channelC.value(),
+        )
+        self._pcr_worker.moveToThread(self._pcr_thread)
+
+        # Connect signals
+        self._pcr_thread.started.connect(self._pcr_worker.run)
+        self._pcr_worker.finished_ok.connect(self._on_pcr_finished)
+        self._pcr_worker.error.connect(self._on_pcr_error)
+        self._pcr_worker.finished_ok.connect(self._pcr_thread.quit)
+        self._pcr_worker.finished_ok.connect(self._pcr_worker.deleteLater)
+        self._pcr_thread.finished.connect(self._pcr_thread.deleteLater)
+        self._pcr_worker.progress.connect(self._on_pcr_progress)
+        self._pcr_worker.cancel_ack.connect(self._on_pcr_cancel_ack)
+
+        # Progress dialog with cancel button
+        self._pcr_dialog = PCRProgressDialog(self)
+        self._pcr_dialog.cancel_requested.connect(self._on_pcr_cancel_clicked)
+
+        self._pcr_thread.start()
+        self._pcr_dialog.show()
+
+    def _on_pcr_cancel_clicked(self):
+        """User pressed cancel in the PCR progress dialog."""
+        if hasattr(self, '_pcr_worker') and self._pcr_worker is not None:
+            self._pcr_worker.request_cancel()
+        # Give immediate visual feedback in the dialog while
+        # the worker finishes the current bias point.
+        if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
+            self._pcr_dialog.set_finishing_up()
+
+    def _on_pcr_cancel_ack(self):
+        """Worker acknowledged cancel; now finishing current bias."""
+        if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
+            self._pcr_dialog.set_finishing_up()
+
+    def _on_pcr_progress(self, text):
+        """Update progress dialog text and live PCR plot from worker."""
+        # Simple string: just log and update dialog label
+        if isinstance(text, str):
+            print(text)
+            if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
+                self._pcr_dialog.set_status(text)
+            return
+
+        # Structured dict with live data snapshot
+        if not isinstance(text, dict):
+            return
+
+        if text.get('type') != 'update':
+            return
+
+        import numpy as np
+
+        I_b = text['I_b']
+        x_vals = text['x_vals']
+        Counts = text['Counts']
+        Counts_off = text['Counts_off']
+        measurement_type = text['measurement_type']
+        trigger_levels = text['trigger_levels']
+
+        num_trigger_levels = len(trigger_levels)
+        ax = self.correlationAxis
+        ax.clear()
+
+        colors = compute_pcr_colors(num_trigger_levels)
+
+        for j in range(num_trigger_levels):
+            color = colors[j % len(colors)]
+
+            if measurement_type == 'filtered_pcr':
+                y_array = np.array(Counts[j], dtype=float)
+                valid = ~np.isnan(y_array)
+                if not np.any(valid):
+                    continue
+                valid_x = np.array(x_vals)[valid]
+                valid_y = y_array[valid]
+
+                label = f'TL {j+1}: {trigger_levels[j]}'
+                ax.plot(valid_x, valid_y, color=color, marker='o', markersize=4, linestyle='-', label=label)
+
+                if Counts_off is not None:
+                    y_dark = np.array(Counts_off[j], dtype=float)
+                    valid_dark = y_dark[valid]
+                    ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--')
+
+                ax.set_title('Gated PCR Curve')
+
+            else:  # dcr
+                avg_counts = []
+                for count_array in Counts[j]:
+                    if isinstance(count_array, np.ndarray):
+                        avg_counts.append(np.mean(count_array))
+                    else:
+                        avg_counts.append(count_array)
+
+                avg_counts = np.array(avg_counts, dtype=float)
+                valid = ~np.isnan(avg_counts)
+                if not np.any(valid):
+                    continue
+                valid_x = np.array(x_vals)[valid]
+                valid_y = avg_counts[valid]
+
+                label = f'DCR TL: {trigger_levels[j]}'
+                ax.plot(valid_x, valid_y, color=color, linestyle='-', label=label)
+                ax.set_title('DCR Curve')
+
+        ax.set_xlabel('Bias Current (uA)')
+        ax.set_ylabel('Counts')
+        ax.grid(True)
+        ax.legend(loc='best')
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+        if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
+            self._pcr_dialog.set_status(f'Biases completed: {len(x_vals)} / {len(I_b)}')
+
+    def _on_pcr_error(self, message):
+        """Handle errors from the PCR worker."""
+        print(message)
+        if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
+            self._pcr_dialog.reject()
+            self._pcr_dialog = None
+
+    def _on_pcr_finished(self, result):
+        """Worker finished successfully; save CSV and shutdown instruments."""
+        I_b = result['I_b']
+        x_vals = result['x_vals']
+        Counts = result['Counts']
+        Counts_off = result['Counts_off']
+        trigger_levels = result['trigger_levels']
+        measurement_type = result['measurement_type']
+        num_bins = result['num_bins']
+        params = result['params']
+        filename = result['filename']
+
+        num_trigger_levels = len(trigger_levels)
+
         try:
             with open(filename, 'w', newline='') as csvfile:
                 csvwriter = csv.writer(csvfile)
-                # Dynamically generate header based on measurement type
                 header = ['Bias_Current']
                 if measurement_type == 'filtered_pcr':
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'Counts_TL{j+1}({tl})')
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'DCounts_TL{j+1}({tl})')
-                else:  # dcr - create columns for each bin
+                else:
                     for j, tl in enumerate(trigger_levels):
                         for bin_idx in range(num_bins):
                             header.append(f'DCR_TL{j+1}({tl})_Bin{bin_idx+1}')
-                        
+
                 csvwriter.writerow(header)
 
-                # Write data rows
-                for row_idx in range(len(I_b)):
-                    row = [I_b[row_idx]]
-                    
+                # The worker may have truncated x_vals/Counts if cancelled
+                num_rows = len(x_vals)
+                for row_idx in range(num_rows):
+                    row = [x_vals[row_idx]]
+
                     if measurement_type == 'filtered_pcr':
-                        # Append signal counts for this bias
                         for tl_idx in range(num_trigger_levels):
-                            # Handle potential NaN values when writing to CSV (replace with empty string or specific value)
                             count_val = Counts[tl_idx][row_idx]
                             row.append(count_val if not numpy.isnan(count_val) else '')
-                        
-                        # Append dark counts only for filtered PCR
+
                         if Counts_off is not None:
                             for tl_idx in range(num_trigger_levels):
                                 dcount_val = Counts_off[tl_idx][row_idx]
                                 row.append(dcount_val if not numpy.isnan(dcount_val) else '')
-                    
-                    else:  # dcr - write all bins for each trigger level
+                    else:
                         for tl_idx in range(num_trigger_levels):
                             count_data = Counts[tl_idx][row_idx]
                             if isinstance(count_data, numpy.ndarray):
-                                # Write each bin value
                                 for bin_val in count_data:
                                     row.append(bin_val if not numpy.isnan(bin_val) else '')
                             else:
-                                # Handle case where it's a single value (e.g., NaN for failed measurements)
-                                for bin_idx in range(num_bins):
+                                for _ in range(num_bins):
                                     row.append(count_data if not numpy.isnan(count_data) else '')
-                    
+
                     csvwriter.writerow(row)
 
             print(f"CSV data saved as: {filename}")
         except Exception as e:
             print(f"Error writing CSV file: {e}")
-        
-        time.sleep(0.5) 
-        # Shutdown instruments based on YAML configuration
+
+        # Pop up a separate Matplotlib window at the end of the measurement
+        # to allow detailed zooming and manual PNG saving, matching the
+        # original PCR() behavior.
+        try:
+
+            # phd_style(jupyterStyle=False)
+            import numpy as np
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots()
+            num_trigger_levels = len(trigger_levels)
+            colors = compute_pcr_colors(num_trigger_levels)
+
+            for j in range(num_trigger_levels):
+                color = colors[j % len(colors)] if colors else None
+
+                if measurement_type == 'filtered_pcr':
+                    y_array = np.array(Counts[j], dtype=float)
+                    valid = ~np.isnan(y_array)
+                    if not np.any(valid):
+                        continue
+                    valid_x = np.array(x_vals)[valid]
+                    valid_y = y_array[valid]
+
+                    label = f'TL {j+1}: {trigger_levels[j]}'
+                    ax.plot(valid_x, valid_y, color=color, marker='o', markersize=4, linestyle='-', label=label)
+
+                    if Counts_off is not None:
+                        y_dark = np.array(Counts_off[j], dtype=float)
+                        valid_dark = y_dark[valid]
+                        ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--')
+
+                else:  # dcr
+                    avg_counts = []
+                    for count_array in Counts[j]:
+                        if isinstance(count_array, np.ndarray):
+                            avg_counts.append(np.mean(count_array))
+                        else:
+                            avg_counts.append(count_array)
+
+                    avg_counts = np.array(avg_counts, dtype=float)
+                    valid = ~np.isnan(avg_counts)
+                    if not np.any(valid):
+                        continue
+                    valid_x = np.array(x_vals)[valid]
+                    valid_y = avg_counts[valid]
+
+                    label = f'DCR TL: {trigger_levels[j]}'
+                    ax.plot(valid_x, valid_y, color=color, marker='o', linestyle='-', label=label)
+
+            ax.set_xlabel('Bias Current (uA)')
+            ax.set_ylabel('Counts')
+            ax.grid(True)
+            ax.legend(loc='best', fancybox=False)
+            fig.tight_layout()
+            # Blocking window the user can zoom/pan and save from.
+            plt.show()
+        except Exception as e:
+            print(f"Error showing final PCR plot window: {e}")
+
+        time.sleep(0.5)
         self._shutdown_instruments(params)
+
+        if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
+            self._pcr_dialog.accept()
+            self._pcr_dialog = None
 
     def saveTrace(self):
         self.tagger.reset()

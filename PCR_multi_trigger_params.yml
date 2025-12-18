@@ -1,8 +1,8 @@
 voltage:
   start: 0.00 # 0.14 # 0.010 # 0.08
-  stop: 0.02 # 0.21 # 0.30
-  step: 0.002
-integration_time: 6
+  stop: 0.12 # 0.21 # 0.30
+  step: 0.003
+integration_time: 5
 turn_off_after_pcr:
   cryo_amp: true
   thermal_source: true
@@ -10,16 +10,16 @@ turn_off_after_pcr:
 
 measurement_type: "filtered_pcr" # options are 'filtered_pcr' or 'dcr'
 
-fudge_factor: 0.9925  # Adjust this factor to calibrate the ratio_on value
+fudge_factor: 0.985  # Adjust this factor to calibrate the ratio_on value
 
 filtered_PCR: 
   trigger_levels:
-    - "0.007"
+    # - "0.007"
     - "0.008"
     # - "0.009"
-    # - "0.010"
+    - "0.010"
     # - "0.011"
-    # - "0.012"
+    - "0.012"
     # - "0.013"
     # - "0.014"
     # - "0.015"
