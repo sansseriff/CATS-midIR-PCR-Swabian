@@ -102,7 +102,7 @@ class PCRWorker(QObject):
     cancel_ack = Signal()
 
     def __init__(self, tagger, params, filename, png_filename,
-                 ratio_on_fudged, ratio_off_fudged,
+                 ratio_on, ratio_off,
                  filtered_on_channel, filtered_off_channel,
                  active_snspd_channel,
                  set_bias_fn,
@@ -113,8 +113,8 @@ class PCRWorker(QObject):
         self.params = params
         self.filename = filename
         self.png_filename = png_filename
-        self.ratio_on_fudged = ratio_on_fudged
-        self.ratio_off_fudged = ratio_off_fudged
+        self.ratio_on = ratio_on
+        self.ratio_off = ratio_off
         self.filtered_on_channel = filtered_on_channel
         self.filtered_off_channel = filtered_off_channel
         self.active_snspd_channel = active_snspd_channel
@@ -159,7 +159,7 @@ class PCRWorker(QObject):
             import time
 
             params = self.params
-            fudge_factor = params['fudge_factor']
+            fudge_factor = float(params.get('fudge_factor', 1.0))
 
             # Extract common parameters
             Start = params['voltage']['start']
@@ -205,6 +205,10 @@ class PCRWorker(QObject):
             Counts = [[] for _ in range(num_trigger_levels)]
             Counts_off = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
 
+            # Raw click totals for each trigger level (only meaningful for filtered_pcr)
+            Clicks_on = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
+            Clicks_off = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
+
             x_vals = []
 
             # --- Simple ETA estimation ---
@@ -233,6 +237,10 @@ class PCRWorker(QObject):
                             Counts[j].append(numpy.nan)
                             if Counts_off is not None:
                                 Counts_off[j].append(numpy.nan)
+                            if Clicks_on is not None:
+                                Clicks_on[j].append(numpy.nan)
+                            if Clicks_off is not None:
+                                Clicks_off[j].append(numpy.nan)
                         else:
                             Counts[j].append(numpy.full(num_bins, numpy.nan))
                     continue
@@ -275,8 +283,21 @@ class PCRWorker(QObject):
                         clicks_on = cr_on.getData()
                         clicks_off = cr_off.getData()
 
-                        count = (clicks_on[0][0] / (self.ratio_on_fudged * int_time_sec)) - (clicks_off[0][0] / (self.ratio_off_fudged * int_time_sec))
-                        dark_count = (clicks_off[0][0] / (self.ratio_off_fudged * int_time_sec))
+                        # Store raw click totals for CSV export
+                        clicks_on_total = clicks_on[0][0]
+                        clicks_off_total = clicks_off[0][0]
+                        if Clicks_on is not None:
+                            Clicks_on[j].append(clicks_on_total)
+                        if Clicks_off is not None:
+                            Clicks_off[j].append(clicks_off_total)
+
+                        # Apply fudge_factor here so the YAML knob directly affects
+                        # the derived rates (Counts and Counts_off).
+                        ratio_on_eff = self.ratio_on * fudge_factor
+                        ratio_off_eff = self.ratio_off / fudge_factor
+
+                        count = (clicks_on[0][0] / (ratio_on_eff * int_time_sec)) - (clicks_off[0][0] / (ratio_off_eff * int_time_sec))
+                        dark_count = (clicks_off[0][0] / (ratio_off_eff * int_time_sec))
 
                         Counts[j].append(count)
                         if Counts_off is not None:
@@ -311,6 +332,8 @@ class PCRWorker(QObject):
                     'x_vals': list(x_vals),
                     'Counts': Counts,
                     'Counts_off': Counts_off,
+                    'Clicks_on': Clicks_on,
+                    'Clicks_off': Clicks_off,
                     'measurement_type': measurement_type,
                     'trigger_levels': trigger_levels,
                 })
@@ -325,6 +348,8 @@ class PCRWorker(QObject):
                 'x_vals': x_vals,
                 'Counts': Counts,
                 'Counts_off': Counts_off,
+                'Clicks_on': Clicks_on,
+                'Clicks_off': Clicks_off,
                 'trigger_levels': trigger_levels,
                 'measurement_type': measurement_type,
                 'num_bins': num_bins,
@@ -607,6 +632,8 @@ class CoincidenceExample(QMainWindow):
         # phd_style(jupyterStyle=True, data_width=1)
         phd_grid_style(grid=True)
 
+        self.load_params()
+
         # --- Added for robust connection ---
         self.source_port = '/dev/ttyUSB0' # Initial port
         self.possible_ports = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2'] # Ports to try
@@ -678,7 +705,7 @@ class CoincidenceExample(QMainWindow):
         self.save_requested = False
         self.save_filename = None
 
-        self.load_params()
+        
 
 
     def load_params(self):
@@ -1355,8 +1382,9 @@ class CoincidenceExample(QMainWindow):
 
         try:
             fudge_factor = params['fudge_factor']
-            self.ratio_on_fudged = self.ratio_on * fudge_factor
-            self.ratio_off_fudged = self.ratio_off / fudge_factor
+            # The worker applies fudge_factor when computing Counts/Counts_off.
+            ratio_on = self.ratio_on
+            ratio_off = self.ratio_off
 
             measurement_type = params.get('measurement_type', 'filtered_pcr').lower()
             print(f"Measurement type: {measurement_type}")
@@ -1404,8 +1432,8 @@ class CoincidenceExample(QMainWindow):
             params=params,
             filename=filename,
             png_filename=png_filename,
-            ratio_on_fudged=self.ratio_on_fudged,
-            ratio_off_fudged=self.ratio_off_fudged,
+            ratio_on=ratio_on,
+            ratio_off=ratio_off,
             filtered_on_channel=filtered_on_channel,
             filtered_off_channel=filtered_off_channel,
             active_snspd_channel=active_snspd_channel,
@@ -1539,6 +1567,8 @@ class CoincidenceExample(QMainWindow):
         x_vals = result['x_vals']
         Counts = result['Counts']
         Counts_off = result['Counts_off']
+        Clicks_on = result.get('Clicks_on', None)
+        Clicks_off = result.get('Clicks_off', None)
         trigger_levels = result['trigger_levels']
         measurement_type = result['measurement_type']
         num_bins = result['num_bins']
@@ -1550,12 +1580,37 @@ class CoincidenceExample(QMainWindow):
         try:
             with open(filename, 'w', newline='') as csvfile:
                 csvwriter = csv.writer(csvfile)
+
+                # ---- Metadata block (always saved) ----
+                try:
+                    mode = str(params.get('mode', '')).strip()
+                    gating_delays_all = params.get('gating_delays', {}) or {}
+                    gating_active = gating_delays_all.get(mode, {}) if mode else {}
+                    csvwriter.writerow(['# metadata', 'value'])
+                    if mode:
+                        csvwriter.writerow(['mode', mode])
+                    if 'fudge_factor' in params:
+                        csvwriter.writerow(['fudge_factor', params.get('fudge_factor', '')])
+                    if gating_active:
+                        csvwriter.writerow(['on_start', gating_active.get('on_start', '')])
+                        csvwriter.writerow(['on_stop', gating_active.get('on_stop', '')])
+                        csvwriter.writerow(['off_start', gating_active.get('off_start', '')])
+                        csvwriter.writerow(['off_stop', gating_active.get('off_stop', '')])
+                    csvwriter.writerow([])
+                except Exception:
+                    # Metadata should never prevent saving data.
+                    pass
+
                 header = ['Bias_Current']
                 if measurement_type == 'filtered_pcr':
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'Counts_TL{j+1}({tl})')
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'DCounts_TL{j+1}({tl})')
+                    for j, tl in enumerate(trigger_levels):
+                        header.append(f'ClicksOn_TL{j+1}({tl})')
+                    for j, tl in enumerate(trigger_levels):
+                        header.append(f'ClicksOff_TL{j+1}({tl})')
                 else:
                     for j, tl in enumerate(trigger_levels):
                         for bin_idx in range(num_bins):
@@ -1577,6 +1632,23 @@ class CoincidenceExample(QMainWindow):
                             for tl_idx in range(num_trigger_levels):
                                 dcount_val = Counts_off[tl_idx][row_idx]
                                 row.append(dcount_val if not numpy.isnan(dcount_val) else '')
+
+                        # Raw clicks (if available)
+                        if Clicks_on is not None:
+                            for tl_idx in range(num_trigger_levels):
+                                cval = Clicks_on[tl_idx][row_idx]
+                                row.append(cval if not numpy.isnan(cval) else '')
+                        else:
+                            for _ in range(num_trigger_levels):
+                                row.append('')
+
+                        if Clicks_off is not None:
+                            for tl_idx in range(num_trigger_levels):
+                                cval = Clicks_off[tl_idx][row_idx]
+                                row.append(cval if not numpy.isnan(cval) else '')
+                        else:
+                            for _ in range(num_trigger_levels):
+                                row.append('')
                     else:
                         for tl_idx in range(num_trigger_levels):
                             count_data = Counts[tl_idx][row_idx]

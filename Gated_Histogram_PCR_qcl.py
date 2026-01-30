@@ -298,7 +298,7 @@ class CoincidenceExample(QMainWindow):
 
         # for us right now (oct 9 2024), self.active_channels[2] (3rd row) is 5, which is the snspd
         #self.filtered = GatedChannel(self.tagger, self.active_channels[2], self.active_channels[0], -self.active_channels[0])
-        self.delay_1_start = DelayedChannel(self.tagger, self.active_channels[0], int(20e6))
+        self.delay_1_start = DelayedChannel(self.tagger, self.active_channels[0], int(10e6))
         self.delay_1_stop = DelayedChannel(self.tagger, self.active_channels[0], int(30e6))
 
         

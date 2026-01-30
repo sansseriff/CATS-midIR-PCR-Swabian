@@ -1,15 +1,15 @@
 voltage:
   start: 0.00 # 0.14 # 0.010 # 0.08
-  stop: 0.12 # 0.21 # 0.30
-  step: 0.003
-integration_time: 5
+  stop: 0.085 # 0.21 # 0.30
+  step: 0.002
+integration_time: 15
 turn_off_after_pcr:
   cryo_amp: true
   thermal_source: true
   sim928: true
 
 # Mode toggle: "thermal_source" or "qcl"
-mode: "thermal_source"
+mode: "qcl" #"thermal_source"
 
 # Gating delays in milliseconds (multiplied by 1e9 in the code to get ps)
 gating_delays:
@@ -19,27 +19,27 @@ gating_delays:
     off_start: 450
     off_stop: 950
   qcl:
-    on_start: 0.02  # 20 microseconds
-    on_stop: 0.03   # 30 microseconds
-    off_start: 0.8  # 800 microseconds (placeholder based on common QCL setups)
-    off_stop: 0.95  # 950 microseconds
+    on_start: 0.100  
+    on_stop: 0.290  
+    off_start: 0.600  # 160 microseconds
+    off_stop: 30 #0.340  
 
 measurement_type: "filtered_pcr" # options are 'filtered_pcr' or 'dcr'
 
-fudge_factor: 0.985  # Adjust this factor to calibrate the ratio_on value
+fudge_factor: 1  # Adjust this factor to calibrate the ratio_on value
 
 filtered_PCR: 
   trigger_levels:
     # - "0.007"
-    - "0.008"
+    # - "0.008"
     # - "0.009"
-    - "0.010"
+    # - "0.010"
     # - "0.011"
     - "0.012"
     # - "0.013"
-    # - "0.014"
+    - "0.014"
     # - "0.015"
-    # - "0.016"
+    - "0.016"
     # - "0.017"
     # - "0.018"
     # - "0.019"
