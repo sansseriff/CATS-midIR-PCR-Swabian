@@ -150,6 +150,72 @@ class PCRWorker(QObject):
             return True
         return False
 
+    @staticmethod
+    def _derive_averages(measurement_type, num_trigger_levels, num_bias_pts,
+                         fudge_factor, int_time_sec, ratio_on, ratio_off,
+                         Acc_clicks_on, Acc_clicks_off,
+                         Acc_dcr, Acc_n, num_bins):
+        """Derive list-of-lists Counts/Counts_off/Clicks from accumulators.
+
+        Computes running-average rates from accumulated raw click totals
+        across cycles.  Returns (Counts, Counts_off, Clicks_on, Clicks_off)
+        in the same list-of-lists format the GUI and CSV writer expect.
+
+        For filtered_pcr the averaged rate is computed as:
+            total_integration = int_time_sec * n_cycles_contributing
+            signal = on_clicks / (ratio_on_eff * total_integration)
+                   - off_clicks / (ratio_off_eff * total_integration)
+            dark   = off_clicks / (ratio_off_eff * total_integration)
+        This is mathematically equivalent to averaging the per-cycle rates.
+
+        Clicks_on / Clicks_off report the *accumulated* raw click totals
+        (summed across all contributing cycles).
+        """
+        import numpy
+
+        ratio_on_eff = ratio_on * fudge_factor
+        ratio_off_eff = ratio_off / fudge_factor
+
+        if measurement_type == 'filtered_pcr':
+            Counts     = [[] for _ in range(num_trigger_levels)]
+            Counts_off = [[] for _ in range(num_trigger_levels)]
+            Clicks_on  = [[] for _ in range(num_trigger_levels)]
+            Clicks_off = [[] for _ in range(num_trigger_levels)]
+
+            for j in range(num_trigger_levels):
+                for i in range(num_bias_pts):
+                    n = Acc_n[j, i]
+                    if n == 0:
+                        Counts[j].append(numpy.nan)
+                        Counts_off[j].append(numpy.nan)
+                        Clicks_on[j].append(numpy.nan)
+                        Clicks_off[j].append(numpy.nan)
+                    else:
+                        total_on  = Acc_clicks_on[j, i]
+                        total_off = Acc_clicks_off[j, i]
+                        total_int = int_time_sec * n
+
+                        signal = (total_on / (ratio_on_eff * total_int)) - (total_off / (ratio_off_eff * total_int))
+                        dark   = total_off / (ratio_off_eff * total_int)
+
+                        Counts[j].append(signal)
+                        Counts_off[j].append(dark)
+                        Clicks_on[j].append(total_on)
+                        Clicks_off[j].append(total_off)
+
+            return Counts, Counts_off, Clicks_on, Clicks_off
+        else:
+            # DCR: average the accumulated bin-rate arrays
+            Counts = [[] for _ in range(num_trigger_levels)]
+            for j in range(num_trigger_levels):
+                for i in range(num_bias_pts):
+                    n = Acc_n[j, i]
+                    if n == 0:
+                        Counts[j].append(numpy.full(num_bins, numpy.nan))
+                    else:
+                        Counts[j].append(Acc_dcr[j, i, :] / n)
+            return Counts, None, None, None
+
     def run(self):
         """Main worker entry point executed in the background thread."""
         try:
@@ -167,6 +233,9 @@ class PCRWorker(QObject):
             Step = params['voltage']['step']
             int_time_sec = params['integration_time']
             measurement_type = params.get('measurement_type', 'filtered_pcr').lower()
+            num_cycles = int(params.get('cycles', 1))
+            if num_cycles < 1:
+                num_cycles = 1
 
             # Extract measurement-specific parameters
             if measurement_type == 'filtered_pcr':
@@ -202,145 +271,194 @@ class PCRWorker(QObject):
                 num_bins = 1
                 bin_time_ps = int_time
 
-            Counts = [[] for _ in range(num_trigger_levels)]
-            Counts_off = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
+            num_bias_pts = len(I_b)
 
-            # Raw click totals for each trigger level (only meaningful for filtered_pcr)
-            Clicks_on = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
-            Clicks_off = [[] for _ in range(num_trigger_levels)] if measurement_type == 'filtered_pcr' else None
+            # ---- Accumulators: fixed-size arrays [trigger_level][bias_index] ----
+            # These accumulate raw totals across cycles; derived rates are
+            # recomputed from them so the average improves each cycle.
 
-            x_vals = []
+            if measurement_type == 'filtered_pcr':
+                # Accumulated raw click totals across all cycles
+                Acc_clicks_on  = numpy.zeros((num_trigger_levels, num_bias_pts))
+                Acc_clicks_off = numpy.zeros((num_trigger_levels, num_bias_pts))
+                # Track how many valid cycles contributed to each (tl, bias) cell
+                Acc_n = numpy.zeros((num_trigger_levels, num_bias_pts), dtype=int)
+            else:
+                # DCR: accumulate bin-count-per-sec arrays
+                Acc_dcr = numpy.zeros((num_trigger_levels, num_bias_pts, num_bins))
+                Acc_n = numpy.zeros((num_trigger_levels, num_bias_pts), dtype=int)
 
-            # --- Simple ETA estimation ---
-            total_biases = len(I_b)
-            total_triggers = total_biases * num_trigger_levels
-            # Integration time per trigger plus a small overhead (s)
+            # x_vals is just the bias current array (populated once)
+            x_vals = list(I_b)
+
+            # ---- Simple ETA estimation (now accounts for cycles) ----
+            total_biases = num_bias_pts
+            total_triggers = total_biases * num_trigger_levels * num_cycles
             per_trigger_est = float(int_time_sec) + 0.3
             total_estimated = max(1.0, total_triggers * per_trigger_est)
             start_time = time.time()
             eta_time = start_time + total_estimated
 
             self.progress.emit(
-                "Starting PCR measurement… Estimated duration: "
-                f"{total_estimated/60:.1f} min (ETA {time.strftime('%H:%M:%S', time.localtime(eta_time))})"
+                f"Starting PCR measurement ({num_cycles} cycle{'s' if num_cycles > 1 else ''})… "
+                f"Estimated duration: {total_estimated/60:.1f} min "
+                f"(ETA {time.strftime('%H:%M:%S', time.localtime(eta_time))})"
             )
 
-            # Outer loop over bias points
-            for i in range(len(I_b)):
-                # Match original PCR(): set SIM928 bias for this offset
-                set_voltage_success = self.set_bias_fn(offset[i])
-                if not set_voltage_success:
-                    # Mirror original behavior: append NaNs/placeholders and skip
-                    x_vals.append(I_b[i])
-                    for j in range(num_trigger_levels):
-                        if measurement_type == 'filtered_pcr':
-                            Counts[j].append(numpy.nan)
-                            if Counts_off is not None:
-                                Counts_off[j].append(numpy.nan)
-                            if Clicks_on is not None:
-                                Clicks_on[j].append(numpy.nan)
-                            if Clicks_off is not None:
-                                Clicks_off[j].append(numpy.nan)
-                        else:
-                            Counts[j].append(numpy.full(num_bins, numpy.nan))
-                    continue
-                if self._cancel_requested and not self._cancel_ack_emitted:
-                    # Note: we still run this bias fully; cancel only affects
-                    # whether we continue to the *next* bias.
-                    self.cancel_ack.emit()
-                    self._cancel_ack_emitted = True
-                    self.progress.emit("Cancel requested – finishing current bias…")
+            cycles_completed = 0
+            cancel_break = False
 
-                current_bias_ua = I_b[i]
-                x_vals.append(current_bias_ua)
-                self.progress.emit(f"Bias index {i+1}/{len(I_b)}, I = {current_bias_ua:.3f} µA")
+            # ============================================================
+            # Outer loop over CYCLES
+            # ============================================================
+            for cycle in range(num_cycles):
+                if cancel_break:
+                    break
 
-                # Configure counters for this bias
-                if measurement_type == 'filtered_pcr':
-                    cr_on = Counter(self.tagger, [self.filtered_on_channel], binwidth=int_time, n_values=1)
-                    cr_off = Counter(self.tagger, [self.filtered_off_channel], binwidth=int_time, n_values=1)
-                    cr_dcr = None
-                else:
-                    cr_dcr = Counter(self.tagger, [self.active_snspd_channel], binwidth=bin_time_ps, n_values=num_bins)
-                    cr_on = None
-                    cr_off = None
+                self.progress.emit(f"── Cycle {cycle+1}/{num_cycles} ──")
 
-                # Inner loop over trigger levels – always complete
-                for j, trigger_level in enumerate(trigger_levels):
-                    trigger_level_float = float(trigger_level)
-                    # Match original PCR(): sweep trigger on channel C
-                    self.tagger.setTriggerLevel(self.channelC, trigger_level_float)
-                    self.progress.emit(f"  Trigger {j+1}/{num_trigger_levels}: {trigger_level_float:.3f} V")
+                # Ramp bias back to start for each new cycle
+                self.set_bias_fn(offset[0])
 
-                    time.sleep(0.2)
+                # Loop over bias points
+                for i in range(num_bias_pts):
+                    set_voltage_success = self.set_bias_fn(offset[i])
+                    if not set_voltage_success:
+                        # Skip this bias point for this cycle (accumulators
+                        # keep whatever they had from previous cycles).
+                        self.progress.emit(
+                            f"  Bias {i+1}/{num_bias_pts}: voltage set FAILED, skipping"
+                        )
+                        continue
 
-                    if measurement_type == 'filtered_pcr' and cr_on is not None and cr_off is not None:
-                        cr_on.startFor(int_time, clear=True)
-                        cr_off.startFor(int_time, clear=True)
-                        cr_on.waitUntilFinished()
-                        cr_off.waitUntilFinished()
+                    if self._cancel_requested and not self._cancel_ack_emitted:
+                        self.cancel_ack.emit()
+                        self._cancel_ack_emitted = True
+                        self.progress.emit("Cancel requested – finishing current bias…")
 
-                        clicks_on = cr_on.getData()
-                        clicks_off = cr_off.getData()
-
-                        # Store raw click totals for CSV export
-                        clicks_on_total = clicks_on[0][0]
-                        clicks_off_total = clicks_off[0][0]
-                        if Clicks_on is not None:
-                            Clicks_on[j].append(clicks_on_total)
-                        if Clicks_off is not None:
-                            Clicks_off[j].append(clicks_off_total)
-
-                        # Apply fudge_factor here so the YAML knob directly affects
-                        # the derived rates (Counts and Counts_off).
-                        ratio_on_eff = self.ratio_on * fudge_factor
-                        ratio_off_eff = self.ratio_off / fudge_factor
-
-                        count = (clicks_on[0][0] / (ratio_on_eff * int_time_sec)) - (clicks_off[0][0] / (ratio_off_eff * int_time_sec))
-                        dark_count = (clicks_off[0][0] / (ratio_off_eff * int_time_sec))
-
-                        Counts[j].append(count)
-                        if Counts_off is not None:
-                            Counts_off[j].append(dark_count)
-                        self.progress.emit(f"    Signal: {count:.3f}, Dark: {dark_count:.3f}")
-
-                    elif measurement_type == 'dcr' and cr_dcr is not None:
-                        cr_dcr.startFor(int_time, clear=True)
-                        cr_dcr.waitUntilFinished()
-
-                        clicks_data = cr_dcr.getData()
-                        bin_counts = clicks_data[0]
-                        bin_counts_per_sec = bin_counts / bin_duration
-                        Counts[j].append(bin_counts_per_sec)
-                        avg_count = numpy.mean(bin_counts_per_sec)
-                        self.progress.emit(f"    DCR avg: {avg_count:.2f} Hz")
-
-                    # Update ETA/progress after each trigger
-                    completed_triggers = i * num_trigger_levels + (j + 1)
-                    elapsed = max(0.0, time.time() - start_time)
-                    fraction = min(1.0, completed_triggers / float(total_triggers)) if total_triggers > 0 else 1.0
-                    remaining_est = max(0.0, total_estimated * (1.0 - fraction))
+                    current_bias_ua = I_b[i]
                     self.progress.emit(
-                        f"Elapsed {elapsed/60:.1f} min, est. remaining {remaining_est/60:.1f} min"
+                        f"  Cycle {cycle+1}/{num_cycles}, Bias {i+1}/{num_bias_pts}, "
+                        f"I = {current_bias_ua:.3f} µA"
                     )
 
-                # After finishing this bias, emit a structured
-                # snapshot so the GUI can update the live plot.
-                self.progress.emit({
-                    'type': 'update',
-                    'I_b': I_b,
-                    'x_vals': list(x_vals),
-                    'Counts': Counts,
-                    'Counts_off': Counts_off,
-                    'Clicks_on': Clicks_on,
-                    'Clicks_off': Clicks_off,
-                    'measurement_type': measurement_type,
-                    'trigger_levels': trigger_levels,
-                })
+                    # Configure counters for this bias
+                    if measurement_type == 'filtered_pcr':
+                        cr_on = Counter(self.tagger, [self.filtered_on_channel], binwidth=int_time, n_values=1)
+                        cr_off = Counter(self.tagger, [self.filtered_off_channel], binwidth=int_time, n_values=1)
+                        cr_dcr = None
+                    else:
+                        cr_dcr = Counter(self.tagger, [self.active_snspd_channel], binwidth=bin_time_ps, n_values=num_bins)
+                        cr_on = None
+                        cr_off = None
 
-                # Respect cancel between bias points
-                if self._check_cancel_after_bias():
-                    break
+                    # Inner loop over trigger levels – always complete
+                    for j, trigger_level in enumerate(trigger_levels):
+                        trigger_level_float = float(trigger_level)
+                        self.tagger.setTriggerLevel(self.channelC, trigger_level_float)
+                        self.progress.emit(
+                            f"    Trigger {j+1}/{num_trigger_levels}: {trigger_level_float:.3f} V"
+                        )
+
+                        time.sleep(0.2)
+
+                        if measurement_type == 'filtered_pcr' and cr_on is not None and cr_off is not None:
+                            cr_on.startFor(int_time, clear=True)
+                            cr_off.startFor(int_time, clear=True)
+                            cr_on.waitUntilFinished()
+                            cr_off.waitUntilFinished()
+
+                            clicks_on = cr_on.getData()
+                            clicks_off = cr_off.getData()
+
+                            clicks_on_total = clicks_on[0][0]
+                            clicks_off_total = clicks_off[0][0]
+
+                            # Accumulate raw clicks
+                            Acc_clicks_on[j, i]  += clicks_on_total
+                            Acc_clicks_off[j, i] += clicks_off_total
+                            Acc_n[j, i] += 1
+
+                            # Show instantaneous values for this single integration
+                            ratio_on_eff = self.ratio_on * fudge_factor
+                            ratio_off_eff = self.ratio_off / fudge_factor
+                            inst_signal = (clicks_on_total / (ratio_on_eff * int_time_sec)) - (clicks_off_total / (ratio_off_eff * int_time_sec))
+                            inst_dark   = clicks_off_total / (ratio_off_eff * int_time_sec)
+                            self.progress.emit(
+                                f"      Signal(inst): {inst_signal:.3f}, Dark(inst): {inst_dark:.3f}"
+                            )
+
+                        elif measurement_type == 'dcr' and cr_dcr is not None:
+                            cr_dcr.startFor(int_time, clear=True)
+                            cr_dcr.waitUntilFinished()
+
+                            clicks_data = cr_dcr.getData()
+                            bin_counts = clicks_data[0]
+                            bin_counts_per_sec = bin_counts / bin_duration
+                            Acc_dcr[j, i, :] += bin_counts_per_sec
+                            Acc_n[j, i] += 1
+                            avg_count = numpy.mean(bin_counts_per_sec)
+                            self.progress.emit(f"      DCR avg(inst): {avg_count:.2f} Hz")
+
+                        # Update ETA/progress after each trigger
+                        completed_triggers = (
+                            cycle * num_bias_pts * num_trigger_levels
+                            + i * num_trigger_levels
+                            + (j + 1)
+                        )
+                        elapsed = max(0.0, time.time() - start_time)
+                        fraction = min(1.0, completed_triggers / float(total_triggers)) if total_triggers > 0 else 1.0
+                        remaining_est = max(0.0, total_estimated * (1.0 - fraction))
+                        self.progress.emit(
+                            f"Elapsed {elapsed/60:.1f} min, est. remaining {remaining_est/60:.1f} min"
+                        )
+
+                    # ---- Derive running-average arrays for live plot ----
+                    Counts, Counts_off, Clicks_on, Clicks_off = self._derive_averages(
+                        measurement_type, num_trigger_levels, num_bias_pts,
+                        fudge_factor, int_time_sec,
+                        self.ratio_on, self.ratio_off,
+                        Acc_clicks_on if measurement_type == 'filtered_pcr' else None,
+                        Acc_clicks_off if measurement_type == 'filtered_pcr' else None,
+                        Acc_dcr if measurement_type != 'filtered_pcr' else None,
+                        Acc_n, num_bins,
+                    )
+
+                    # Emit live-plot snapshot after each bias point
+                    self.progress.emit({
+                        'type': 'update',
+                        'I_b': I_b,
+                        'x_vals': list(x_vals),
+                        'Counts': Counts,
+                        'Counts_off': Counts_off,
+                        'Clicks_on': Clicks_on,
+                        'Clicks_off': Clicks_off,
+                        'measurement_type': measurement_type,
+                        'trigger_levels': trigger_levels,
+                        'cycle': cycle + 1,
+                        'num_cycles': num_cycles,
+                        'current_bias_ua': current_bias_ua,
+                        'bias_index': i,
+                        'num_bias_pts': num_bias_pts,
+                    })
+
+                    # Respect cancel between bias points
+                    if self._check_cancel_after_bias():
+                        cancel_break = True
+                        break
+
+                cycles_completed = cycle + 1
+
+            # ---- Final derived averages for the result ----
+            Counts, Counts_off, Clicks_on, Clicks_off = self._derive_averages(
+                measurement_type, num_trigger_levels, num_bias_pts,
+                fudge_factor, int_time_sec,
+                self.ratio_on, self.ratio_off,
+                Acc_clicks_on if measurement_type == 'filtered_pcr' else None,
+                Acc_clicks_off if measurement_type == 'filtered_pcr' else None,
+                Acc_dcr if measurement_type != 'filtered_pcr' else None,
+                Acc_n, num_bins,
+            )
 
             # Package data and let the GUI do CSV + shutdown
             result = {
@@ -355,8 +473,11 @@ class PCRWorker(QObject):
                 'num_bins': num_bins,
                 'bin_duration': bin_duration,
                 'int_time_sec': int_time_sec,
+                'num_cycles': num_cycles,
+                'cycles_completed': cycles_completed,
                 'params': params,
                 'filename': self.filename,
+                'cancelled': self._cancel_requested,
             }
             self.finished_ok.emit(result)
 
@@ -391,6 +512,78 @@ class PCRProgressDialog(QDialog):
     def set_finishing_up(self):
         self.label.setText("Finishing up current bias point…")
         self.cancel_button.setEnabled(False)
+
+
+class ShutdownConfirmationDialog(QDialog):
+    """Dialog asking user whether to shut down instruments after PCR cancel.
+    
+    Has a 30-second timeout. If no choice is made, falls back to YAML config.
+    """
+
+    def __init__(self, parent=None):
+        super(ShutdownConfirmationDialog, self).__init__(parent)
+        self.setWindowTitle("Shutdown Instruments?")
+        self.setModal(True)
+        
+        self.user_choice = None  # Will be 'yes', 'no', or None (timeout)
+        self.timeout_seconds = 30
+        self.remaining_seconds = self.timeout_seconds
+        
+        self.setupUI()
+        
+        # Timer to update countdown and handle timeout
+        self.countdown_timer = QTimer(self)
+        self.countdown_timer.setInterval(1000)  # 1 second
+        self.countdown_timer.timeout.connect(self._on_countdown_tick)
+        self.countdown_timer.start()
+        
+    def setupUI(self):
+        layout = QVBoxLayout(self)
+        
+        self.question_label = QLabel(
+            "Turn off cryoamp, thermal source, and sim928?"
+        )
+        layout.addWidget(self.question_label)
+        
+        self.countdown_label = QLabel(
+            f"(Defaulting to YAML config in {self.remaining_seconds} seconds)"
+        )
+        layout.addWidget(self.countdown_label)
+        
+        button_layout = QHBoxLayout()
+        
+        self.yes_button = QPushButton("Yes")
+        self.yes_button.clicked.connect(self._on_yes_clicked)
+        button_layout.addWidget(self.yes_button)
+        
+        self.no_button = QPushButton("No")
+        self.no_button.clicked.connect(self._on_no_clicked)
+        button_layout.addWidget(self.no_button)
+        
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+        
+    def _on_countdown_tick(self):
+        self.remaining_seconds -= 1
+        if self.remaining_seconds <= 0:
+            self.countdown_timer.stop()
+            self.user_choice = None  # Timeout - use YAML config
+            self.accept()
+        else:
+            self.countdown_label.setText(
+                f"(Defaulting to YAML config in {self.remaining_seconds} seconds)"
+            )
+    
+    def _on_yes_clicked(self):
+        self.countdown_timer.stop()
+        self.user_choice = 'yes'
+        self.accept()
+        
+    def _on_no_clicked(self):
+        self.countdown_timer.stop()
+        self.user_choice = 'no'
+        self.accept()
+
 
 class SIM928ControlDialog(QDialog):
     """Modal dialog for controlling the SIM928 voltage source"""
@@ -881,29 +1074,6 @@ class CoincidenceExample(QMainWindow):
 
         self.BlockIndex = 0
 
-        # Only recreate the counter if its parameter has changed,
-        # else we'll clear the count trace too often
-        coincidenceWindow = self.ui.coincidenceWindow.value()
-        if self.last_channels != self.active_channels or self.last_coincidenceWindow != coincidenceWindow:
-            self.last_channels = self.active_channels
-            self.last_coincidenceWindow = coincidenceWindow
-
-            # Create the virtual coincidence channel
-            self.coincidences = Coincidences(
-                self.tagger,
-                [self.active_channels[1:]],
-                coincidenceWindow
-            )
-
-            # Measure the count rate of both input channels and the coincidence channel
-            # Use 200 * 50ms binning
-            self.counter = Counter(
-                self.tagger,
-                self.active_channels + list(self.coincidences.getChannels()),
-                binwidth=int(50e9),
-                n_values=200
-            )
-
         print(self.active_channels)
 
 
@@ -934,12 +1104,47 @@ class CoincidenceExample(QMainWindow):
         self.ratio_on = (on_stop - on_start) / 1000
         self.ratio_off = (off_stop - off_start) / 1000
 
+        # Scale by pulse repetition rate: in QCL mode there are multiple
+        # pulses per second; in thermal_source mode there is always 1.
+        if mode == 'qcl':
+            pulse_rep_rate = float(self.params.get('pulse_rep_rate', 1))
+        else:
+            pulse_rep_rate = 1.0
+        self.ratio_on *= pulse_rep_rate
+        self.ratio_off *= pulse_rep_rate
+        print(f"pulse_rep_rate: {pulse_rep_rate}, ratio_on: {self.ratio_on}, ratio_off: {self.ratio_off}")
+
 
         # thermal source on
         self.filtered_on = GatedChannel(self.tagger, self.active_channels[2], self.delay_1_start.getChannel(), self.delay_1_stop.getChannel())
 
         # thermal source off
         self.filtered_off = GatedChannel(self.tagger, self.active_channels[2], self.delay_2_start.getChannel(), self.delay_2_stop.getChannel())
+
+
+
+        # Only recreate the counter if its parameter has changed,
+        # else we'll clear the count trace too often
+        coincidenceWindow = self.ui.coincidenceWindow.value()
+        if self.last_channels != self.active_channels or self.last_coincidenceWindow != coincidenceWindow:
+            self.last_channels = self.active_channels
+            self.last_coincidenceWindow = coincidenceWindow
+
+            # Create the virtual coincidence channel
+            self.coincidences = Coincidences(
+                self.tagger,
+                [self.active_channels[1:]],
+                coincidenceWindow
+            )
+
+            # Measure the count rate of both input channels and the coincidence channel
+            # Use 200 * 50ms binning
+            self.counter = Counter(
+                self.tagger,
+                self.active_channels + list([self.filtered_on.getChannel()]),
+                binwidth=int(50e9),
+                n_values=200
+            )
 
 
         # Measure the correlation between A and B
@@ -1350,6 +1555,46 @@ class CoincidenceExample(QMainWindow):
         except Exception as e:
             print(f"Error in instrument shutdown: {e}")
 
+    def _shutdown_all_instruments(self):
+        """
+        Shutdown all instruments unconditionally (used when user confirms shutdown after cancel).
+        """
+        try:
+            print("Shutting down all instruments...")
+            
+            # Turn off SIM928
+            try:
+                if self.source is not None:
+                    self.source.turnOff()
+                    print("SIM928 turned off successfully")
+                else:
+                    print("SIM928 not available for shutdown")
+            except Exception as e:
+                print(f"Error turning off SIM928: {e}")
+            
+            # Turn off cryo_amp (channel 3 of power supply)
+            try:
+                if self.power_supply is not None:
+                    self.power_supply.output_off(3)
+                    print("Cryo amp (channel 3) turned off successfully")
+                else:
+                    print("Power supply not available for cryo amp shutdown")
+            except Exception as e:
+                print(f"Error turning off cryo amp: {e}")
+            
+            # Turn off thermal_source (channel 2 of function generator)
+            try:
+                if self.function_gen is not None:
+                    self.function_gen.set_output(2, 0)
+                    print("Thermal source (channel 2) turned off successfully")
+                else:
+                    print("Function generator not available for thermal source shutdown")
+            except Exception as e:
+                print(f"Error turning off thermal source: {e}")
+                    
+        except Exception as e:
+            print(f"Error in instrument shutdown: {e}")
+
     def PCR(self):
         """Start the PCR measurement in a background thread with cancel support."""
 
@@ -1523,7 +1768,12 @@ class CoincidenceExample(QMainWindow):
                     valid_dark = y_dark[valid]
                     ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--')
 
-                ax.set_title('Gated PCR Curve')
+                cycle_info = text.get('cycle', '')
+                num_cycles_info = text.get('num_cycles', 1)
+                if num_cycles_info > 1:
+                    ax.set_title(f'Gated PCR Curve (cycle {cycle_info}/{num_cycles_info})')
+                else:
+                    ax.set_title('Gated PCR Curve')
 
             else:  # dcr
                 avg_counts = []
@@ -1542,7 +1792,18 @@ class CoincidenceExample(QMainWindow):
 
                 label = f'DCR TL: {trigger_levels[j]}'
                 ax.plot(valid_x, valid_y, color=color, linestyle='-', label=label)
-                ax.set_title('DCR Curve')
+
+                cycle_info = text.get('cycle', '')
+                num_cycles_info = text.get('num_cycles', 1)
+                if num_cycles_info > 1:
+                    ax.set_title(f'DCR Curve (cycle {cycle_info}/{num_cycles_info})')
+                else:
+                    ax.set_title('DCR Curve')
+
+        # Draw a vertical line at the current bias point
+        current_bias = text.get('current_bias_ua', None)
+        if current_bias is not None:
+            ax.axvline(x=current_bias, color='gray', linestyle=':', linewidth=1.0, alpha=0.7)
 
         ax.set_xlabel('Bias Current (uA)')
         ax.set_ylabel('Counts')
@@ -1552,7 +1813,20 @@ class CoincidenceExample(QMainWindow):
         self.canvas.draw_idle()
 
         if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
-            self._pcr_dialog.set_status(f'Biases completed: {len(x_vals)} / {len(I_b)}')
+            cycle = text.get('cycle', 1)
+            num_cycles = text.get('num_cycles', 1)
+            bias_idx = text.get('bias_index', 0)
+            num_bias = text.get('num_bias_pts', 0)
+            bias_str = f'{current_bias:.3f} µA' if current_bias is not None else '?'
+            if num_cycles > 1:
+                self._pcr_dialog.set_status(
+                    f'Cycle {cycle}/{num_cycles}  —  '
+                    f'Bias {bias_idx + 1}/{num_bias} ({bias_str})'
+                )
+            else:
+                self._pcr_dialog.set_status(
+                    f'Bias {bias_idx + 1}/{num_bias} ({bias_str})'
+                )
 
     def _on_pcr_error(self, message):
         """Handle errors from the PCR worker."""
@@ -1574,6 +1848,8 @@ class CoincidenceExample(QMainWindow):
         num_bins = result['num_bins']
         params = result['params']
         filename = result['filename']
+        num_cycles = result.get('num_cycles', 1)
+        cycles_completed = result.get('cycles_completed', 1)
 
         num_trigger_levels = len(trigger_levels)
 
@@ -1591,6 +1867,9 @@ class CoincidenceExample(QMainWindow):
                         csvwriter.writerow(['mode', mode])
                     if 'fudge_factor' in params:
                         csvwriter.writerow(['fudge_factor', params.get('fudge_factor', '')])
+                    csvwriter.writerow(['cycles', num_cycles])
+                    csvwriter.writerow(['cycles_completed', cycles_completed])
+                    csvwriter.writerow(['integration_time', params.get('integration_time', '')])
                     if gating_active:
                         csvwriter.writerow(['on_start', gating_active.get('on_start', '')])
                         csvwriter.writerow(['on_stop', gating_active.get('on_stop', '')])
@@ -1726,7 +2005,23 @@ class CoincidenceExample(QMainWindow):
             print(f"Error showing final PCR plot window: {e}")
 
         time.sleep(0.5)
-        self._shutdown_instruments(params)
+
+        # Show shutdown confirmation dialog with 30-second timeout
+        shutdown_dialog = ShutdownConfirmationDialog(self)
+        shutdown_dialog.exec_()
+        
+        user_choice = shutdown_dialog.user_choice
+        if user_choice == 'yes':
+            # User chose to shut down all instruments
+            print("User chose to shut down instruments.")
+            self._shutdown_all_instruments()
+        elif user_choice == 'no':
+            # User chose not to shut down
+            print("User chose NOT to shut down instruments.")
+        else:
+            # Timeout - use YAML config
+            print("Timeout reached. Using YAML configuration for shutdown.")
+            self._shutdown_instruments(params)
 
         if hasattr(self, '_pcr_dialog') and self._pcr_dialog is not None:
             self._pcr_dialog.accept()
@@ -1938,6 +2233,64 @@ class CoincidenceExample(QMainWindow):
         self.fig.tight_layout()
         self.canvas.draw()
 
+    def remove_peak(self, data, index=None):
+        """Truncate the correlation's center (0-delay) bin.
+
+        The correlation histogram includes an artificial spike at ~0 delay because
+        every event contributes to the center bin. For visualization, truncate the
+        center bin height down to the height of the second-largest bin (i.e. the
+        maximum of all *other* bins).
+
+        Parameters
+        ----------
+        data : array-like
+            1D histogram counts.
+        index : array-like, optional
+            1D x-axis positions (ps) corresponding to `data`. If provided, the
+            center bin is chosen as the bin(s) closest to 0.
+        """
+        if data is None:
+            return data
+
+        arr = numpy.asarray(data)
+        if arr.ndim != 1 or arr.size < 3:
+            return arr
+
+        # Work on a copy so we don't mutate persistent accumulation arrays.
+        out = arr.copy()
+
+        try:
+            if index is not None:
+                idx_arr = numpy.asarray(index)
+                if idx_arr.shape[0] == out.shape[0]:
+                    abs_idx = numpy.abs(idx_arr)
+                    min_abs = numpy.nanmin(abs_idx)
+                    center_idxs = numpy.where(abs_idx == min_abs)[0]
+                else:
+                    center_idxs = numpy.array([out.size // 2])
+            else:
+                center_idxs = numpy.array([out.size // 2])
+
+            if center_idxs.size == 0:
+                return out
+
+            mask = numpy.ones(out.shape[0], dtype=bool)
+            mask[center_idxs] = False
+            if not numpy.any(mask):
+                return out
+
+            # "Second largest" relative to an oversized center peak.
+            max_other = numpy.nanmax(out[mask])
+            if not numpy.isfinite(max_other):
+                return out
+
+            # Only truncate if the center is larger.
+            out[center_idxs] = numpy.where(out[center_idxs] > max_other, max_other, out[center_idxs])
+            return out
+        except Exception:
+            # Never let display-only truncation break acquisition.
+            return out
+
     def draw(self):
         '''Handler for the timer event to update the plots'''
         if self.running:
@@ -1984,8 +2337,8 @@ class CoincidenceExample(QMainWindow):
             #print(numpy.sum(currentData))
             self.IntType = self.ui.IntType.currentText()
 
-
-            #Histdata = self.correlation.getData()
+            # remove giant peak at zero delay for better visualization
+            currentData = self.remove_peak(currentData, index=index)
             # display data averaged for one second
             self.plt_correlation[0].set_ydata(currentData)
             #self.plt_gauss[0].set_ydata(gauss)
@@ -1999,6 +2352,9 @@ class CoincidenceExample(QMainWindow):
             self.correlation.clear()
 
             self.BlockIndex = self.BlockIndex + 1
+
+
+    
 
 
 # If this file is executed, initialize PySide2, create a TimeTagger object, and show the UI

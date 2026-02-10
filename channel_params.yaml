@@ -3,7 +3,7 @@ Channels:
     channel: 9
     dead_time: 0
     delay: 0
-    trigger: 0.25
+    trigger: 0.1
   ChB:
     channel: 18
     dead_time: 0
