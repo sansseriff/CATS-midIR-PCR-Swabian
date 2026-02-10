@@ -756,6 +756,309 @@ class Keysight33622AControlDialog(QDialog):
         else:
             QMessageBox.warning(self, "Error", "Function generator not available")
 
+
+class PowerRampDialog(QDialog):
+    """Interactive dialog for the Power Ramp measurement.
+
+    The operator manually adjusts QCL current between each measurement
+    point while the detector bias is held fixed.  The dialog collects
+    signal/dark count rates at each QCL current and live-plots the result.
+
+    Flow
+    ----
+    1. Ask for bias voltage → set SIM928.
+    2. Ask for trigger level → set on tagger.
+    3. Loop:
+        a. Ask for QCL current (mA) – or finish.
+        b. Integrate and compute signal / dark.
+        c. Append to arrays, update live plot.
+    4. On "Finish" → save CSV, show final plot.
+    """
+
+    def __init__(self, parent_window, parent=None):
+        super(PowerRampDialog, self).__init__(parent)
+        self.parent_window = parent_window
+        self.setWindowTitle("Power Ramp Measurement")
+        self.setModal(True)
+        self.resize(420, 320)
+
+        # Data accumulators
+        self.qcl_currents = []
+        self.signal_rates = []
+        self.dark_rates = []
+        self.clicks_on_list = []
+        self.clicks_off_list = []
+
+        # Will be set after the first prompts
+        self.bias_voltage = None
+        self.trigger_level_value = None
+        self.filename = None
+
+        self._build_ui()
+
+    # ---- UI construction ------------------------------------------------
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.status_label = QLabel("Press Start to begin.")
+        layout.addWidget(self.status_label)
+
+        # --- Bias voltage input ---
+        bias_group = QGroupBox("1. Detector Bias Voltage")
+        bias_lay = QHBoxLayout()
+        bias_lay.addWidget(QLabel("Bias V:"))
+        self.bias_spinbox = QDoubleSpinBox()
+        self.bias_spinbox.setRange(0.0, 15.0)
+        self.bias_spinbox.setDecimals(4)
+        self.bias_spinbox.setSingleStep(0.001)
+        self.bias_spinbox.setSuffix(" V")
+        self.bias_spinbox.setValue(0.0)
+        bias_lay.addWidget(self.bias_spinbox)
+        bias_group.setLayout(bias_lay)
+        layout.addWidget(bias_group)
+
+        # --- Trigger level input ---
+        trig_group = QGroupBox("2. Trigger Level")
+        trig_lay = QHBoxLayout()
+        trig_lay.addWidget(QLabel("Trigger:"))
+        self.trigger_spinbox = QDoubleSpinBox()
+        self.trigger_spinbox.setRange(-2.5, 2.5)
+        self.trigger_spinbox.setDecimals(4)
+        self.trigger_spinbox.setSingleStep(0.001)
+        self.trigger_spinbox.setSuffix(" V")
+        self.trigger_spinbox.setValue(0.014)
+        trig_lay.addWidget(self.trigger_spinbox)
+        trig_group.setLayout(trig_lay)
+        layout.addWidget(trig_group)
+
+        # --- QCL current input (reused each iteration) ---
+        qcl_group = QGroupBox("3. QCL Current (enter & measure)")
+        qcl_lay = QHBoxLayout()
+        qcl_lay.addWidget(QLabel("QCL I:"))
+        self.qcl_spinbox = QDoubleSpinBox()
+        self.qcl_spinbox.setRange(0.0, 9999.0)
+        self.qcl_spinbox.setDecimals(2)
+        self.qcl_spinbox.setSingleStep(1.0)
+        self.qcl_spinbox.setSuffix(" mA")
+        self.qcl_spinbox.setValue(0.0)
+        qcl_lay.addWidget(self.qcl_spinbox)
+        self.measure_button = QPushButton("Measure")
+        self.measure_button.clicked.connect(self._on_measure_clicked)
+        self.measure_button.setEnabled(False)
+        qcl_lay.addWidget(self.measure_button)
+        qcl_group.setLayout(qcl_lay)
+        layout.addWidget(qcl_group)
+
+        # --- Results label ---
+        self.result_label = QLabel("")
+        layout.addWidget(self.result_label)
+
+        # --- Bottom buttons ---
+        btn_lay = QHBoxLayout()
+        self.start_button = QPushButton("Start")
+        self.start_button.clicked.connect(self._on_start_clicked)
+        btn_lay.addWidget(self.start_button)
+
+        self.finish_button = QPushButton("Finish && Save")
+        self.finish_button.clicked.connect(self._on_finish_clicked)
+        self.finish_button.setEnabled(False)
+        btn_lay.addWidget(self.finish_button)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        btn_lay.addWidget(self.cancel_button)
+
+        layout.addLayout(btn_lay)
+
+    # ---- Handlers --------------------------------------------------------
+
+    def _on_start_clicked(self):
+        """Set bias, set trigger, and enable the QCL measurement loop."""
+        # Ask for CSV filename
+        filename, _ = QFileDialog().getSaveFileName(
+            parent=self,
+            caption='Save Power Ramp Data',
+            directory='Power_Ramp_Data.csv',
+            filter='CSV Files (*.csv);;All Files (*)',
+            options=QFileDialog.DontUseNativeDialog,
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith('.csv'):
+            filename += '.csv'
+        self.filename = filename
+
+        # Set bias voltage on SIM928
+        self.bias_voltage = self.bias_spinbox.value()
+        success = self.parent_window._set_source_voltage_robustly(self.bias_voltage)
+        if not success:
+            QMessageBox.warning(self, "Error", "Failed to set SIM928 bias voltage.")
+            return
+
+        # Set trigger level on channel C
+        self.trigger_level_value = self.trigger_spinbox.value()
+        channelC = self.parent_window.ui.channelC.value()
+        self.parent_window.tagger.setTriggerLevel(channelC, self.trigger_level_value)
+
+        self.status_label.setText(
+            f"Bias = {self.bias_voltage:.4f} V, "
+            f"Trigger = {self.trigger_level_value:.4f} V\n"
+            "Enter QCL current and press Measure."
+        )
+
+        # Lock the setup inputs, enable measurement
+        self.bias_spinbox.setEnabled(False)
+        self.trigger_spinbox.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.measure_button.setEnabled(True)
+        self.finish_button.setEnabled(True)
+
+    def _on_measure_clicked(self):
+        """Take one filtered-PCR integration at the current QCL current."""
+        import time as _time
+
+        pw = self.parent_window
+        params = pw.params
+        int_time_sec = float(params.get('integration_time', 10))
+        fudge_factor = float(params.get('fudge_factor', 1.0))
+        int_time_ps = int(int_time_sec * 1e12)
+
+        qcl_current = self.qcl_spinbox.value()
+
+        self.status_label.setText(f"Integrating for {int_time_sec} s …")
+        QApplication.processEvents()
+
+        try:
+            filtered_on_ch = pw.filtered_on.getChannel()
+            filtered_off_ch = pw.filtered_off.getChannel()
+
+            cr_on = Counter(pw.tagger, [filtered_on_ch], binwidth=int_time_ps, n_values=1)
+            cr_off = Counter(pw.tagger, [filtered_off_ch], binwidth=int_time_ps, n_values=1)
+
+            _time.sleep(0.2)
+
+            cr_on.startFor(int_time_ps, clear=True)
+            cr_off.startFor(int_time_ps, clear=True)
+            cr_on.waitUntilFinished()
+            cr_off.waitUntilFinished()
+
+            clicks_on_total = cr_on.getData()[0][0]
+            clicks_off_total = cr_off.getData()[0][0]
+
+            ratio_on_eff = pw.ratio_on * fudge_factor
+            ratio_off_eff = pw.ratio_off / fudge_factor
+
+            signal = (clicks_on_total / (ratio_on_eff * int_time_sec)) \
+                   - (clicks_off_total / (ratio_off_eff * int_time_sec))
+            dark = clicks_off_total / (ratio_off_eff * int_time_sec)
+
+            # Store
+            self.qcl_currents.append(qcl_current)
+            self.signal_rates.append(signal)
+            self.dark_rates.append(dark)
+            self.clicks_on_list.append(clicks_on_total)
+            self.clicks_off_list.append(clicks_off_total)
+
+            n = len(self.qcl_currents)
+            self.result_label.setText(
+                f"Point {n}: QCL = {qcl_current:.2f} mA → "
+                f"Signal = {signal:.3f}, Dark = {dark:.3f}"
+            )
+            self.status_label.setText("Ready for next QCL current.")
+
+            # Update the live plot on the main window
+            self._update_live_plot()
+
+        except Exception as e:
+            self.status_label.setText(f"Measurement error: {e}")
+            print(f"Power ramp measurement error: {e}")
+
+    def _update_live_plot(self):
+        """Redraw the correlationAxis in the main window with power ramp data."""
+        import numpy as np
+
+        ax = self.parent_window.correlationAxis
+        ax.clear()
+
+        x = np.array(self.qcl_currents)
+        sig = np.array(self.signal_rates)
+        drk = np.array(self.dark_rates)
+
+        colors = compute_pcr_colors(2)
+        ax.plot(x, sig, color=colors[0], marker='o', markersize=5,
+                linestyle='-', label='Signal')
+        ax.plot(x, drk, color=colors[1], marker='s', markersize=4,
+                linestyle='--', label='Dark')
+
+        ax.set_xlabel('QCL Current (mA)')
+        ax.set_ylabel('Count Rate (Hz)')
+        ax.set_title(f'Power Ramp  (bias = {self.bias_voltage:.4f} V)')
+        ax.grid(True)
+        ax.legend(loc='best')
+        self.parent_window.fig.tight_layout()
+        self.parent_window.canvas.draw_idle()
+
+    def _on_finish_clicked(self):
+        """Save collected data to CSV and show a final matplotlib window."""
+        import numpy as np
+        import csv as _csv
+
+        if not self.qcl_currents:
+            QMessageBox.information(self, "No data", "No measurements to save.")
+            return
+
+        # --- Save CSV ---
+        try:
+            with open(self.filename, 'w', newline='') as f:
+                writer = _csv.writer(f)
+                writer.writerow(['# Power Ramp Measurement'])
+                writer.writerow(['bias_voltage_V', self.bias_voltage])
+                writer.writerow(['trigger_level_V', self.trigger_level_value])
+                writer.writerow(['integration_time_s',
+                                 self.parent_window.params.get('integration_time', '')])
+                writer.writerow(['fudge_factor',
+                                 self.parent_window.params.get('fudge_factor', '')])
+                writer.writerow([])
+                writer.writerow(['QCL_Current_mA', 'Signal_Hz', 'Dark_Hz',
+                                 'ClicksOn', 'ClicksOff'])
+                for i in range(len(self.qcl_currents)):
+                    writer.writerow([
+                        self.qcl_currents[i],
+                        self.signal_rates[i],
+                        self.dark_rates[i],
+                        self.clicks_on_list[i],
+                        self.clicks_off_list[i],
+                    ])
+            print(f"Power ramp CSV saved: {self.filename}")
+        except Exception as e:
+            print(f"Error saving power ramp CSV: {e}")
+            QMessageBox.warning(self, "Save Error", f"Failed to save CSV: {e}")
+
+        # --- Pop-up final plot ---
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots()
+            x = np.array(self.qcl_currents)
+            colors = compute_pcr_colors(2)
+            ax.plot(x, self.signal_rates, color=colors[0], marker='o',
+                    markersize=5, linestyle='-', label='Signal')
+            ax.plot(x, self.dark_rates, color=colors[1], marker='s',
+                    markersize=4, linestyle='--', label='Dark')
+            ax.set_xlabel('QCL Current (mA)')
+            ax.set_ylabel('Count Rate (Hz)')
+            ax.set_title(f'Power Ramp  (bias = {self.bias_voltage:.4f} V)')
+            ax.grid(True)
+            ax.legend(loc='best', fancybox=False)
+            fig.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"Error showing final power ramp plot: {e}")
+
+        self.accept()
+
+
 class CoincidenceExample(QMainWindow):
     ''' Small example of how to create a UI for the TimeTagger with the PySide2 framework'''
 
@@ -771,6 +1074,7 @@ class CoincidenceExample(QMainWindow):
         self.ui.triggerScanButton.clicked.connect(self.open_sim928_control)
         self.ui.clearButton.clicked.connect(self.open_keysight33622A_control)
         self.ui.saveButton.clicked.connect(self.saveHistogram)
+        self.ui.powerRampButton.clicked.connect(self.power_ramp)
         # self.ui.saveTagsButton.clicked.connect(self.saveTagsSimple)
         # self.ui.TraceGen.clicked.connect(self.saveTrace)
 
@@ -992,6 +1296,17 @@ class CoincidenceExample(QMainWindow):
     def open_keysight33622A_control(self):
         """Open the Keysight 33622A control dialog"""
         dialog = Keysight33622AControlDialog(self)
+        dialog.exec_()
+
+    def power_ramp(self):
+        """Open the Power Ramp measurement dialog.
+
+        Reloads params and updates gating/measurements before starting,
+        so that ratio_on / ratio_off are current.
+        """
+        self.load_params()
+        self.updateMeasurements()
+        dialog = PowerRampDialog(parent_window=self, parent=self)
         dialog.exec_()
 
     def reInit(self):

@@ -380,6 +380,9 @@ class Ui_CoincidenceExample(object):
         self.saveButton = QtWidgets.QPushButton(self.centralwidget)
         self.saveButton.setObjectName("saveButton")
         self.horizontalLayout_2.addWidget(self.saveButton)
+        self.powerRampButton = QtWidgets.QPushButton(self.centralwidget)
+        self.powerRampButton.setObjectName("powerRampButton")
+        self.horizontalLayout_2.addWidget(self.powerRampButton)
         self.verticalLayout.addLayout(self.horizontalLayout_2)
         CoincidenceExample.setCentralWidget(self.centralwidget)
         self.label_2.setBuddy(self.label_2)
@@ -433,4 +436,5 @@ class Ui_CoincidenceExample(object):
         self.triggerScanButton.setText(QtWidgets.QApplication.translate("CoincidenceExample", "SIM928 Control", None, -1))
         self.clearButton.setText(QtWidgets.QApplication.translate("CoincidenceExample", "Thermal Source", None, -1))
         self.saveButton.setText(QtWidgets.QApplication.translate("CoincidenceExample", "Save Histogram Data", None, -1))
+        self.powerRampButton.setText(QtWidgets.QApplication.translate("CoincidenceExample", "Power Ramp", None, -1))
 
