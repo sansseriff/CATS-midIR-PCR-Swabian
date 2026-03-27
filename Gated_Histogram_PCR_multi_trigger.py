@@ -102,8 +102,8 @@ class PCRWorker(QObject):
     cancel_ack = Signal()
 
     def __init__(self, tagger, params, filename, png_filename,
-                 ratio_on, ratio_off,
-                 filtered_on_channel, filtered_off_channel,
+                 ratio_on, ratio_on_dcr, ratio_off,
+                 filtered_on_channel, filtered_on_dcr_channel, filtered_off_channel,
                  active_snspd_channel,
                  set_bias_fn,
                  channelC,
@@ -114,8 +114,10 @@ class PCRWorker(QObject):
         self.filename = filename
         self.png_filename = png_filename
         self.ratio_on = ratio_on
+        self.ratio_on_dcr = ratio_on_dcr
         self.ratio_off = ratio_off
         self.filtered_on_channel = filtered_on_channel
+        self.filtered_on_dcr_channel = filtered_on_dcr_channel
         self.filtered_off_channel = filtered_off_channel
         self.active_snspd_channel = active_snspd_channel
 
@@ -152,13 +154,14 @@ class PCRWorker(QObject):
 
     @staticmethod
     def _derive_averages(measurement_type, num_trigger_levels, num_bias_pts,
-                         fudge_factor, int_time_sec, ratio_on, ratio_off,
-                         Acc_clicks_on, Acc_clicks_off,
+                         fudge_factor, int_time_sec, ratio_on, ratio_on_dcr, ratio_off,
+                         Acc_clicks_on, Acc_clicks_on_dcr, Acc_clicks_off,
                          Acc_dcr, Acc_n, num_bins):
-        """Derive list-of-lists Counts/Counts_off/Clicks from accumulators.
+        """Derive list-of-lists Counts/Counts_on_dcr/Counts_off/Clicks from accumulators.
 
         Computes running-average rates from accumulated raw click totals
-        across cycles.  Returns (Counts, Counts_off, Clicks_on, Clicks_off)
+        across cycles. Returns
+        (Counts, Counts_on_dcr, Counts_off, Clicks_on, Clicks_on_dcr, Clicks_off)
         in the same list-of-lists format the GUI and CSV writer expect.
 
         For filtered_pcr the averaged rate is computed as:
@@ -174,12 +177,15 @@ class PCRWorker(QObject):
         import numpy
 
         ratio_on_eff = ratio_on * fudge_factor
+        ratio_on_dcr_eff = ratio_on_dcr * fudge_factor
         ratio_off_eff = ratio_off / fudge_factor
 
         if measurement_type == 'filtered_pcr':
             Counts     = [[] for _ in range(num_trigger_levels)]
+            Counts_on_dcr = [[] for _ in range(num_trigger_levels)]
             Counts_off = [[] for _ in range(num_trigger_levels)]
             Clicks_on  = [[] for _ in range(num_trigger_levels)]
+            Clicks_on_dcr = [[] for _ in range(num_trigger_levels)]
             Clicks_off = [[] for _ in range(num_trigger_levels)]
 
             for j in range(num_trigger_levels):
@@ -187,23 +193,29 @@ class PCRWorker(QObject):
                     n = Acc_n[j, i]
                     if n == 0:
                         Counts[j].append(numpy.nan)
+                        Counts_on_dcr[j].append(numpy.nan)
                         Counts_off[j].append(numpy.nan)
                         Clicks_on[j].append(numpy.nan)
+                        Clicks_on_dcr[j].append(numpy.nan)
                         Clicks_off[j].append(numpy.nan)
                     else:
                         total_on  = Acc_clicks_on[j, i]
+                        total_on_dcr = Acc_clicks_on_dcr[j, i]
                         total_off = Acc_clicks_off[j, i]
                         total_int = int_time_sec * n
 
                         signal = (total_on / (ratio_on_eff * total_int)) - (total_off / (ratio_off_eff * total_int))
+                        signal_on_dcr = total_on_dcr / (ratio_on_dcr_eff * total_int)
                         dark   = total_off / (ratio_off_eff * total_int)
 
                         Counts[j].append(signal)
+                        Counts_on_dcr[j].append(signal_on_dcr)
                         Counts_off[j].append(dark)
                         Clicks_on[j].append(total_on)
+                        Clicks_on_dcr[j].append(total_on_dcr)
                         Clicks_off[j].append(total_off)
 
-            return Counts, Counts_off, Clicks_on, Clicks_off
+            return Counts, Counts_on_dcr, Counts_off, Clicks_on, Clicks_on_dcr, Clicks_off
         else:
             # DCR: average the accumulated bin-rate arrays
             Counts = [[] for _ in range(num_trigger_levels)]
@@ -214,7 +226,7 @@ class PCRWorker(QObject):
                         Counts[j].append(numpy.full(num_bins, numpy.nan))
                     else:
                         Counts[j].append(Acc_dcr[j, i, :] / n)
-            return Counts, None, None, None
+            return Counts, None, None, None, None, None
 
     def run(self):
         """Main worker entry point executed in the background thread."""
@@ -277,9 +289,15 @@ class PCRWorker(QObject):
             # These accumulate raw totals across cycles; derived rates are
             # recomputed from them so the average improves each cycle.
 
+            Acc_clicks_on = None
+            Acc_clicks_on_dcr = None
+            Acc_clicks_off = None
+            Acc_dcr = None
+
             if measurement_type == 'filtered_pcr':
                 # Accumulated raw click totals across all cycles
                 Acc_clicks_on  = numpy.zeros((num_trigger_levels, num_bias_pts))
+                Acc_clicks_on_dcr = numpy.zeros((num_trigger_levels, num_bias_pts))
                 Acc_clicks_off = numpy.zeros((num_trigger_levels, num_bias_pts))
                 # Track how many valid cycles contributed to each (tl, bias) cell
                 Acc_n = numpy.zeros((num_trigger_levels, num_bias_pts), dtype=int)
@@ -345,11 +363,13 @@ class PCRWorker(QObject):
                     # Configure counters for this bias
                     if measurement_type == 'filtered_pcr':
                         cr_on = Counter(self.tagger, [self.filtered_on_channel], binwidth=int_time, n_values=1)
+                        cr_on_dcr = Counter(self.tagger, [self.filtered_on_dcr_channel], binwidth=int_time, n_values=1)
                         cr_off = Counter(self.tagger, [self.filtered_off_channel], binwidth=int_time, n_values=1)
                         cr_dcr = None
                     else:
                         cr_dcr = Counter(self.tagger, [self.active_snspd_channel], binwidth=bin_time_ps, n_values=num_bins)
                         cr_on = None
+                        cr_on_dcr = None
                         cr_off = None
 
                     # Inner loop over trigger levels – always complete
@@ -362,33 +382,46 @@ class PCRWorker(QObject):
 
                         time.sleep(0.2)
 
-                        if measurement_type == 'filtered_pcr' and cr_on is not None and cr_off is not None:
+                        if measurement_type == 'filtered_pcr' and cr_on is not None and cr_on_dcr is not None and cr_off is not None:
+                            assert Acc_clicks_on is not None
+                            assert Acc_clicks_on_dcr is not None
+                            assert Acc_clicks_off is not None
                             cr_on.startFor(int_time, clear=True)
                             cr_off.startFor(int_time, clear=True)
+                            cr_on_dcr.startFor(int_time, clear=True)
+
                             cr_on.waitUntilFinished()
                             cr_off.waitUntilFinished()
+                            cr_on_dcr.waitUntilFinished()
 
                             clicks_on = cr_on.getData()
                             clicks_off = cr_off.getData()
+                            clicks_on_dcr = cr_on_dcr.getData()
 
                             clicks_on_total = clicks_on[0][0]
+                            clicks_on_dcr_total = clicks_on_dcr[0][0]
                             clicks_off_total = clicks_off[0][0]
+
 
                             # Accumulate raw clicks
                             Acc_clicks_on[j, i]  += clicks_on_total
+                            Acc_clicks_on_dcr[j, i] += clicks_on_dcr_total
                             Acc_clicks_off[j, i] += clicks_off_total
                             Acc_n[j, i] += 1
 
                             # Show instantaneous values for this single integration
                             ratio_on_eff = self.ratio_on * fudge_factor
+                            ratio_on_dcr_eff = self.ratio_on_dcr * fudge_factor
                             ratio_off_eff = self.ratio_off / fudge_factor
                             inst_signal = (clicks_on_total / (ratio_on_eff * int_time_sec)) - (clicks_off_total / (ratio_off_eff * int_time_sec))
+                            inst_on_dcr = clicks_on_dcr_total / (ratio_on_dcr_eff * int_time_sec)
                             inst_dark   = clicks_off_total / (ratio_off_eff * int_time_sec)
                             self.progress.emit(
-                                f"      Signal(inst): {inst_signal:.3f}, Dark(inst): {inst_dark:.3f}"
+                                f"      Signal(inst): {inst_signal:.3f}, On-DCR(inst): {inst_on_dcr:.3f}, Dark(inst): {inst_dark:.3f}"
                             )
 
                         elif measurement_type == 'dcr' and cr_dcr is not None:
+                            assert Acc_dcr is not None
                             cr_dcr.startFor(int_time, clear=True)
                             cr_dcr.waitUntilFinished()
 
@@ -414,11 +447,19 @@ class PCRWorker(QObject):
                         )
 
                     # ---- Derive running-average arrays for live plot ----
-                    Counts, Counts_off, Clicks_on, Clicks_off = self._derive_averages(
+                    if measurement_type == 'filtered_pcr':
+                        assert Acc_clicks_on is not None
+                        assert Acc_clicks_on_dcr is not None
+                        assert Acc_clicks_off is not None
+                    else:
+                        assert Acc_dcr is not None
+
+                    Counts, Counts_on_dcr, Counts_off, Clicks_on, Clicks_on_dcr, Clicks_off = self._derive_averages(
                         measurement_type, num_trigger_levels, num_bias_pts,
                         fudge_factor, int_time_sec,
-                        self.ratio_on, self.ratio_off,
+                        self.ratio_on, self.ratio_on_dcr, self.ratio_off,
                         Acc_clicks_on if measurement_type == 'filtered_pcr' else None,
+                        Acc_clicks_on_dcr if measurement_type == 'filtered_pcr' else None,
                         Acc_clicks_off if measurement_type == 'filtered_pcr' else None,
                         Acc_dcr if measurement_type != 'filtered_pcr' else None,
                         Acc_n, num_bins,
@@ -430,8 +471,10 @@ class PCRWorker(QObject):
                         'I_b': I_b,
                         'x_vals': list(x_vals),
                         'Counts': Counts,
+                        'Counts_on_dcr': Counts_on_dcr,
                         'Counts_off': Counts_off,
                         'Clicks_on': Clicks_on,
+                        'Clicks_on_dcr': Clicks_on_dcr,
                         'Clicks_off': Clicks_off,
                         'measurement_type': measurement_type,
                         'trigger_levels': trigger_levels,
@@ -450,11 +493,19 @@ class PCRWorker(QObject):
                 cycles_completed = cycle + 1
 
             # ---- Final derived averages for the result ----
-            Counts, Counts_off, Clicks_on, Clicks_off = self._derive_averages(
+            if measurement_type == 'filtered_pcr':
+                assert Acc_clicks_on is not None
+                assert Acc_clicks_on_dcr is not None
+                assert Acc_clicks_off is not None
+            else:
+                assert Acc_dcr is not None
+
+            Counts, Counts_on_dcr, Counts_off, Clicks_on, Clicks_on_dcr, Clicks_off = self._derive_averages(
                 measurement_type, num_trigger_levels, num_bias_pts,
                 fudge_factor, int_time_sec,
-                self.ratio_on, self.ratio_off,
+                self.ratio_on, self.ratio_on_dcr, self.ratio_off,
                 Acc_clicks_on if measurement_type == 'filtered_pcr' else None,
+                Acc_clicks_on_dcr if measurement_type == 'filtered_pcr' else None,
                 Acc_clicks_off if measurement_type == 'filtered_pcr' else None,
                 Acc_dcr if measurement_type != 'filtered_pcr' else None,
                 Acc_n, num_bins,
@@ -465,8 +516,10 @@ class PCRWorker(QObject):
                 'I_b': I_b,
                 'x_vals': x_vals,
                 'Counts': Counts,
+                'Counts_on_dcr': Counts_on_dcr,
                 'Counts_off': Counts_off,
                 'Clicks_on': Clicks_on,
+                'Clicks_on_dcr': Clicks_on_dcr,
                 'Clicks_off': Clicks_off,
                 'trigger_levels': trigger_levels,
                 'measurement_type': measurement_type,
@@ -1201,6 +1254,9 @@ class CoincidenceExample(QMainWindow):
         # Flag for saving histogram when histBlock is full
         self.save_requested = False
         self.save_filename = None
+        self.histogram_start_countrate = None
+        self.histStartCounts = None
+        self.persistentStartCounts = 0.0
 
         
 
@@ -1332,6 +1388,58 @@ class CoincidenceExample(QMainWindow):
         # normalize 'clicks / bin' to 'kclicks / second'
         return 1e12 / bin_index[1] / 1e3
 
+    def _get_nominal_histogram_start_rate_hz(self):
+        """Return the expected start-event rate for the correlation histogram."""
+        mode = str(self.params.get('mode', 'thermal_source')).strip().lower()
+        if mode == 'qcl':
+            try:
+                return float(self.params.get('pulse_rep_rate', 1.0))
+            except (TypeError, ValueError):
+                return 1.0
+        return 1.0
+
+    def _get_histogram_start_rate_hz(self):
+        """Return the measured start-event rate, falling back to the YAML value."""
+        nominal_rate_hz = self._get_nominal_histogram_start_rate_hz()
+
+        try:
+            if self.histogram_start_countrate is not None:
+                data = self.histogram_start_countrate.getData()
+                if len(data) > 0:
+                    measured_rate_hz = float(data[0])
+                    if numpy.isfinite(measured_rate_hz) and measured_rate_hz > 0:
+                        return measured_rate_hz
+        except Exception:
+            pass
+
+        return nominal_rate_hz
+
+    def _normalize_histogram_counts_to_rate(self, counts, start_counts):
+        """Convert histogram counts to instantaneous count rate in Hz.
+
+        For a multiple-start / multiple-stop histogram,
+
+            counts(bin) ~= N_start * rate(delay) * bin_width
+
+        so the instantaneous rate is obtained from
+
+            rate(delay) = counts(bin) / (N_start * bin_width)
+
+        where `N_start` is the accumulated number of detected start events over
+        the displayed integration window.
+        """
+        counts_array = numpy.asarray(counts, dtype=float)
+        binwidth_ps = float(self.ui.correlationBinwidth.value())
+        binwidth_s = binwidth_ps * 1e-12
+
+        if counts_array.size == 0:
+            return counts_array
+
+        if start_counts <= 0 or binwidth_s <= 0:
+            return numpy.zeros_like(counts_array, dtype=float)
+
+        return counts_array / (float(start_counts) * binwidth_s)
+
     def updateMeasurements(self):
         '''Create/Update all TimeTagger measurement objects'''
 
@@ -1382,6 +1490,8 @@ class CoincidenceExample(QMainWindow):
         self.seconds = 1
         print("histblock depth: ", int(self.ui.IntTime.value()*5))
         self.histBlock = numpy.zeros((int(self.ui.IntTime.value()*5),self.ui.correlationBins.value() - self.masked_hist_bins))
+        self.histStartCounts = numpy.zeros(int(self.ui.IntTime.value()*5), dtype='float')
+        self.persistentStartCounts = 0.0
 
         self.buffer = numpy.zeros((1,self.ui.correlationBins.value()))[self.masked_hist_bins:]
         self.buffer_old = numpy.zeros((1, self.ui.correlationBins.value()))[self.masked_hist_bins:]
@@ -1395,28 +1505,39 @@ class CoincidenceExample(QMainWindow):
         # Load gating delays from params based on mode
         mode = self.params.get('mode', 'thermal_source')
         delays = self.params.get('gating_delays', {}).get(mode, {
-            'on_start': 30, 'on_stop': 270, 'off_start': 450, 'off_stop': 950
+            'on_start': 30, 'on_stop': 270,
+            'on_dcr_start': 270, 'on_dcr_stop': 450,
+            'off_start': 450, 'off_stop': 950
         })
         
         on_start = delays.get('on_start', 30)
         on_stop = delays.get('on_stop', 270)
         off_start = delays.get('off_start', 450)
         off_stop = delays.get('off_stop', 950)
+        on_dcr_start = delays.get('on_dcr_start', on_stop)
+        on_dcr_stop = delays.get('on_dcr_stop', off_start)
         
-        print(f"Mode: {mode}, Delays (ms): on=[{on_start}, {on_stop}], off=[{off_start}, {off_stop}]")
+        print(
+            f"Mode: {mode}, Delays (ms): on=[{on_start}, {on_stop}], "
+            f"on_dcr=[{on_dcr_start}, {on_dcr_stop}], off=[{off_start}, {off_stop}]"
+        )
 
         # for us right now (oct 9 2024), self.active_channels[2] (3rd row) is 5, which is the snspd
         self.filtered = GatedChannel(self.tagger, self.active_channels[2], self.active_channels[0], -self.active_channels[0])
         self.delay_1_start = DelayedChannel(self.tagger, self.active_channels[0], int(on_start*1e9))
         self.delay_1_stop = DelayedChannel(self.tagger, self.active_channels[0], int(on_stop*1e9))
 
-        self.delay_2_start = DelayedChannel(self.tagger, self.active_channels[0], int(off_start*1e9))
+        self.delay_1_5_start = DelayedChannel(self.tagger, self.active_channels[0], int(on_dcr_start*1e9))
+        self.delay_1_5_stop = DelayedChannel(self.tagger, self.active_channels[0], int(on_dcr_stop*1e9))
 
+
+        self.delay_2_start = DelayedChannel(self.tagger, self.active_channels[0], int(off_start*1e9))
         self.delay_2_stop = DelayedChannel(self.tagger, self.active_channels[0], int(off_stop*1e9))
         # self.delay_2_stop = DelayedChannel(self.tagger, self.active_channels[0], int(800e9))
 
 
         self.ratio_on = (on_stop - on_start) / 1000
+        self.ratio_on_dcr = (on_dcr_stop - on_dcr_start) / 1000
         self.ratio_off = (off_stop - off_start) / 1000
 
         # Scale by pulse repetition rate: in QCL mode there are multiple
@@ -1426,12 +1547,18 @@ class CoincidenceExample(QMainWindow):
         else:
             pulse_rep_rate = 1.0
         self.ratio_on *= pulse_rep_rate
+        self.ratio_on_dcr *= pulse_rep_rate
         self.ratio_off *= pulse_rep_rate
-        print(f"pulse_rep_rate: {pulse_rep_rate}, ratio_on: {self.ratio_on}, ratio_off: {self.ratio_off}")
+        print(
+            f"pulse_rep_rate: {pulse_rep_rate}, ratio_on: {self.ratio_on}, "
+            f"ratio_on_dcr: {self.ratio_on_dcr}, ratio_off: {self.ratio_off}"
+        )
 
 
         # thermal source on
         self.filtered_on = GatedChannel(self.tagger, self.active_channels[2], self.delay_1_start.getChannel(), self.delay_1_stop.getChannel())
+
+        self.filtered_on_dcr = GatedChannel(self.tagger, self.active_channels[2], self.delay_1_5_start.getChannel(), self.delay_1_5_stop.getChannel())
 
         # thermal source off
         self.filtered_off = GatedChannel(self.tagger, self.active_channels[2], self.delay_2_start.getChannel(), self.delay_2_stop.getChannel())
@@ -1463,17 +1590,28 @@ class CoincidenceExample(QMainWindow):
 
 
         # Measure the correlation between A and B
-        self.correlation = Correlation(
-            self.tagger,
-            #self.a_combined.getChannel(),
-            #self.b_combined.getChannel(),
-            # self.active_channels[1],
-            # self.filtered.getChannel(),
-            self.filtered_on.getChannel(),
-            CHANNEL_UNUSED,
+        # self.correlation = Correlation(
+        #     self.tagger,
+        #     #self.a_combined.getChannel(),
+        #     #self.b_combined.getChannel(),
+        #     # self.active_channels[1],
+        #     # self.filtered.getChannel(),
+        #     self.filtered_on.getChannel(),
+        #     CHANNEL_UNUSED,
 
+        #     self.ui.correlationBinwidth.value(),
+        #     self.ui.correlationBins.value())
+        
+        self.correlation = Histogram(
+            self.tagger,
+            self.active_channels[2],
+            self.active_channels[0],
             self.ui.correlationBinwidth.value(),
             self.ui.correlationBins.value())
+        self.histogram_start_countrate = Countrate(
+            self.tagger,
+            [self.active_channels[0]],
+        )
 
         self.tagger.sync()
 
@@ -1503,7 +1641,10 @@ class CoincidenceExample(QMainWindow):
         self.correlationAxis.clear()
         index = self.correlation.getIndex()[self.masked_hist_bins:]
         #data = self.correlation.getDataNormalized()
-        data = self.correlation.getData()[self.masked_hist_bins:]
+        data = self._normalize_histogram_counts_to_rate(
+            self.correlation.getData()[self.masked_hist_bins:],
+            start_counts=0.0,
+        )
         self.plt_correlation = self.correlationAxis.plot(
             index * 1e-3,
             data
@@ -1512,7 +1653,7 @@ class CoincidenceExample(QMainWindow):
 
 
         self.correlationAxis.set_xlabel('time (ns)')
-        self.correlationAxis.set_ylabel('Counts')
+        self.correlationAxis.set_ylabel('Instantaneous Count Rate (Hz)')
         self.correlationAxis.set_title('Histogram between A and B')
         self.correlationAxis.grid(True)
 
@@ -1944,6 +2085,7 @@ class CoincidenceExample(QMainWindow):
             fudge_factor = params['fudge_factor']
             # The worker applies fudge_factor when computing Counts/Counts_off.
             ratio_on = self.ratio_on
+            ratio_on_dcr = self.ratio_on_dcr
             ratio_off = self.ratio_off
 
             measurement_type = params.get('measurement_type', 'filtered_pcr').lower()
@@ -1980,6 +2122,7 @@ class CoincidenceExample(QMainWindow):
         # Prepare worker and thread
         try:
             filtered_on_channel = self.filtered_on.getChannel()
+            filtered_on_dcr_channel = self.filtered_on_dcr.getChannel()
             filtered_off_channel = self.filtered_off.getChannel()
             active_snspd_channel = self.active_channels[2]
         except Exception as e:
@@ -1993,8 +2136,10 @@ class CoincidenceExample(QMainWindow):
             filename=filename,
             png_filename=png_filename,
             ratio_on=ratio_on,
+            ratio_on_dcr=ratio_on_dcr,
             ratio_off=ratio_off,
             filtered_on_channel=filtered_on_channel,
+            filtered_on_dcr_channel=filtered_on_dcr_channel,
             filtered_off_channel=filtered_off_channel,
             active_snspd_channel=active_snspd_channel,
             set_bias_fn=lambda v: self._set_source_voltage_robustly(v),
@@ -2054,6 +2199,7 @@ class CoincidenceExample(QMainWindow):
         I_b = text['I_b']
         x_vals = text['x_vals']
         Counts = text['Counts']
+        Counts_on_dcr = text.get('Counts_on_dcr', None)
         Counts_off = text['Counts_off']
         measurement_type = text['measurement_type']
         trigger_levels = text['trigger_levels']
@@ -2078,10 +2224,15 @@ class CoincidenceExample(QMainWindow):
                 label = f'TL {j+1}: {trigger_levels[j]}'
                 ax.plot(valid_x, valid_y, color=color, marker='o', markersize=4, linestyle='-', label=label)
 
+                if Counts_on_dcr is not None:
+                    y_on_dcr = np.array(Counts_on_dcr[j], dtype=float)
+                    valid_on_dcr = y_on_dcr[valid]
+                    ax.plot(valid_x, valid_on_dcr, color=color, marker='s', markersize=3, linestyle='-.', label=f'TL {j+1} on_dcr')
+
                 if Counts_off is not None:
                     y_dark = np.array(Counts_off[j], dtype=float)
                     valid_dark = y_dark[valid]
-                    ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--')
+                    ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--', label=f'TL {j+1} dark')
 
                 cycle_info = text.get('cycle', '')
                 num_cycles_info = text.get('num_cycles', 1)
@@ -2155,8 +2306,10 @@ class CoincidenceExample(QMainWindow):
         I_b = result['I_b']
         x_vals = result['x_vals']
         Counts = result['Counts']
+        Counts_on_dcr = result.get('Counts_on_dcr', None)
         Counts_off = result['Counts_off']
         Clicks_on = result.get('Clicks_on', None)
+        Clicks_on_dcr = result.get('Clicks_on_dcr', None)
         Clicks_off = result.get('Clicks_off', None)
         trigger_levels = result['trigger_levels']
         measurement_type = result['measurement_type']
@@ -2188,6 +2341,8 @@ class CoincidenceExample(QMainWindow):
                     if gating_active:
                         csvwriter.writerow(['on_start', gating_active.get('on_start', '')])
                         csvwriter.writerow(['on_stop', gating_active.get('on_stop', '')])
+                        csvwriter.writerow(['on_dcr_start', gating_active.get('on_dcr_start', '')])
+                        csvwriter.writerow(['on_dcr_stop', gating_active.get('on_dcr_stop', '')])
                         csvwriter.writerow(['off_start', gating_active.get('off_start', '')])
                         csvwriter.writerow(['off_stop', gating_active.get('off_stop', '')])
                     csvwriter.writerow([])
@@ -2200,9 +2355,13 @@ class CoincidenceExample(QMainWindow):
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'Counts_TL{j+1}({tl})')
                     for j, tl in enumerate(trigger_levels):
+                        header.append(f'CountsOnDcr_TL{j+1}({tl})')
+                    for j, tl in enumerate(trigger_levels):
                         header.append(f'DCounts_TL{j+1}({tl})')
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'ClicksOn_TL{j+1}({tl})')
+                    for j, tl in enumerate(trigger_levels):
+                        header.append(f'ClicksOnDcr_TL{j+1}({tl})')
                     for j, tl in enumerate(trigger_levels):
                         header.append(f'ClicksOff_TL{j+1}({tl})')
                 else:
@@ -2222,6 +2381,14 @@ class CoincidenceExample(QMainWindow):
                             count_val = Counts[tl_idx][row_idx]
                             row.append(count_val if not numpy.isnan(count_val) else '')
 
+                        if Counts_on_dcr is not None:
+                            for tl_idx in range(num_trigger_levels):
+                                dcr_val = Counts_on_dcr[tl_idx][row_idx]
+                                row.append(dcr_val if not numpy.isnan(dcr_val) else '')
+                        else:
+                            for _ in range(num_trigger_levels):
+                                row.append('')
+
                         if Counts_off is not None:
                             for tl_idx in range(num_trigger_levels):
                                 dcount_val = Counts_off[tl_idx][row_idx]
@@ -2231,6 +2398,14 @@ class CoincidenceExample(QMainWindow):
                         if Clicks_on is not None:
                             for tl_idx in range(num_trigger_levels):
                                 cval = Clicks_on[tl_idx][row_idx]
+                                row.append(cval if not numpy.isnan(cval) else '')
+                        else:
+                            for _ in range(num_trigger_levels):
+                                row.append('')
+
+                        if Clicks_on_dcr is not None:
+                            for tl_idx in range(num_trigger_levels):
+                                cval = Clicks_on_dcr[tl_idx][row_idx]
                                 row.append(cval if not numpy.isnan(cval) else '')
                         else:
                             for _ in range(num_trigger_levels):
@@ -2286,10 +2461,15 @@ class CoincidenceExample(QMainWindow):
                     label = f'TL {j+1}: {trigger_levels[j]}'
                     ax.plot(valid_x, valid_y, color=color, marker='o', markersize=4, linestyle='-', label=label)
 
+                    if Counts_on_dcr is not None:
+                        y_on_dcr = np.array(Counts_on_dcr[j], dtype=float)
+                        valid_on_dcr = y_on_dcr[valid]
+                        ax.plot(valid_x, valid_on_dcr, color=color, marker='s', markersize=3, linestyle='-.', label=f'TL {j+1} on_dcr')
+
                     if Counts_off is not None:
                         y_dark = np.array(Counts_off[j], dtype=float)
                         valid_dark = y_dark[valid]
-                        ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--')
+                        ax.plot(valid_x, valid_dark, color=color, markersize=4, linestyle='--', label=f'TL {j+1} dark')
 
                 else:  # dcr
                     avg_counts = []
@@ -2631,26 +2811,48 @@ class CoincidenceExample(QMainWindow):
 
 
             index = self.correlation.getIndex()[self.masked_hist_bins:]
+            capture_duration_ps = float(self.correlation.getCaptureDuration())
+            capture_duration_s = capture_duration_ps * 1e-12
+            try:
+                if self.histogram_start_countrate is not None:
+                    start_capture_duration_ps = float(self.histogram_start_countrate.getCaptureDuration())
+                    if start_capture_duration_ps > 0:
+                        capture_duration_s = start_capture_duration_ps * 1e-12
+            except Exception:
+                pass
+
+            start_rate_hz = self._get_histogram_start_rate_hz()
+            start_counts = max(0.0, start_rate_hz * capture_duration_s)
 
             q = self.correlation.getData()[self.masked_hist_bins:]
             self.histBlock[self.BlockIndex] = q
+            self.histStartCounts[self.BlockIndex] = start_counts
             #print(numpy.sum(q))
 
             if self.ui.IntType.currentText() == "Discrete":
                 if self.BlockIndex == 0:
                     self.persistentData = numpy.sum(self.histBlock, axis=0)
+                    self.persistentStartCounts = float(numpy.sum(self.histStartCounts))
                 else:
                     if self.IntType == "Rolling":
 
                         # first time changing from Rolling to Discrete
                         self.persistentData = numpy.sum(self.histBlock, axis=0)
+                        self.persistentStartCounts = float(numpy.sum(self.histStartCounts))
                         self.BlockIndex = 1
                         self.IntType = "Discrete"
-                currentData = self.persistentData
+                currentCounts = self.persistentData
+                currentStartCounts = self.persistentStartCounts
             else:
-                    currentData = numpy.sum(self.histBlock, axis=0)
+                    currentCounts = numpy.sum(self.histBlock, axis=0)
+                    currentStartCounts = float(numpy.sum(self.histStartCounts))
             #print(numpy.sum(currentData))
             self.IntType = self.ui.IntType.currentText()
+
+            currentData = self._normalize_histogram_counts_to_rate(
+                currentCounts,
+                currentStartCounts,
+            )
 
             # remove giant peak at zero delay for better visualization
             currentData = self.remove_peak(currentData, index=index)
@@ -2658,6 +2860,7 @@ class CoincidenceExample(QMainWindow):
             self.plt_correlation[0].set_ydata(currentData)
             #self.plt_gauss[0].set_ydata(gauss)
             self.correlationAxis.relim()
+            self.correlationAxis.set_ylabel('Instantaneous Count Rate (Hz)')
             #if self.BlockIndex == 0:
             self.correlationAxis.autoscale_view(True, True, True)
                 #self.correlation.clear()
@@ -2665,6 +2868,8 @@ class CoincidenceExample(QMainWindow):
             #    offset, stdd), 'coincidence window'])
             self.canvas.draw()
             self.correlation.clear()
+            if self.histogram_start_countrate is not None:
+                self.histogram_start_countrate.clear()
 
             self.BlockIndex = self.BlockIndex + 1
 
