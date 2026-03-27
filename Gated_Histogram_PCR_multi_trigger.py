@@ -36,7 +36,7 @@ from matplotlib.colors import LogNorm
 import yaml
 
 # all required TimeTagger dependencies
-from TimeTagger import Coincidences, Histogram2D, Counter, Correlation, createTimeTagger, freeTimeTagger, Histogram, FileWriter, FileReader, TT_CHANNEL_FALLING_EDGES, Resolution, DelayedChannel, GatedChannel, Countrate, CHANNEL_UNUSED
+from TimeTagger import Coincidences, Histogram2D, Counter, Correlation, createTimeTagger, freeTimeTagger, Histogram, FileWriter, FileReader, TT_CHANNEL_FALLING_EDGES, Resolution, DelayedChannel, GatedChannel, Countrate, CHANNEL_UNUSED, SynchronizedMeasurements
 from time import sleep
 import time
 
@@ -1241,22 +1241,24 @@ class CoincidenceExample(QMainWindow):
         self.last_channels = [9, -5, -14, 18]
         self.active_channels = []
         self.last_coincidenceWindow = 0
+        self.draw_timer_interval_ms = 50
+        self.histogram_block_duration_ms = 200
+        self.histogram_sync = None
+        self.histogram_start_counter = None
+        self.histogram_block_running = False
+        self.save_requested = False
+        self.save_filename = None
+        self.histStartCounts = None
+        self.persistentStartCounts = 0.0
         self.updateMeasurements()
 
         # Use a timer to redraw the plots every 100ms
         self.draw()
         self.timer = QTimer()
         self.timer.timeout.connect(self.draw)
-        self.timer.start(200)
+        self.timer.start(self.draw_timer_interval_ms)
         self.clock_divider = 2000  # divider 156.25MHz down to 78.125 KHz
         self.tagger.setEventDivider(18,self.clock_divider)
-        
-        # Flag for saving histogram when histBlock is full
-        self.save_requested = False
-        self.save_filename = None
-        self.histogram_start_countrate = None
-        self.histStartCounts = None
-        self.persistentStartCounts = 0.0
 
         
 
@@ -1379,7 +1381,7 @@ class CoincidenceExample(QMainWindow):
         self.draw()
         self.timer = QTimer()
         self.timer.timeout.connect(self.draw)
-        self.timer.start(200)
+        self.timer.start(self.draw_timer_interval_ms)
         self.tagger.setEventDivider(18, self.clock_divider)
 
 
@@ -1388,31 +1390,25 @@ class CoincidenceExample(QMainWindow):
         # normalize 'clicks / bin' to 'kclicks / second'
         return 1e12 / bin_index[1] / 1e3
 
-    def _get_nominal_histogram_start_rate_hz(self):
-        """Return the expected start-event rate for the correlation histogram."""
-        mode = str(self.params.get('mode', 'thermal_source')).strip().lower()
-        if mode == 'qcl':
-            try:
-                return float(self.params.get('pulse_rep_rate', 1.0))
-            except (TypeError, ValueError):
-                return 1.0
-        return 1.0
+    def _get_histogram_block_duration_ps(self):
+        """Return the live histogram block duration in ps."""
+        return int(self.histogram_block_duration_ms * 1e9)
 
-    def _get_histogram_start_rate_hz(self):
-        """Return the measured start-event rate, falling back to the YAML value."""
-        nominal_rate_hz = self._get_nominal_histogram_start_rate_hz()
+    def _get_histogram_block_count(self):
+        """Return the number of histogram blocks kept in memory."""
+        integration_time_s = float(self.ui.IntTime.value())
+        block_duration_s = self.histogram_block_duration_ms / 1000.0
+        if block_duration_s <= 0:
+            return 1
+        return max(1, int(round(integration_time_s / block_duration_s)))
 
-        try:
-            if self.histogram_start_countrate is not None:
-                data = self.histogram_start_countrate.getData()
-                if len(data) > 0:
-                    measured_rate_hz = float(data[0])
-                    if numpy.isfinite(measured_rate_hz) and measured_rate_hz > 0:
-                        return measured_rate_hz
-        except Exception:
-            pass
+    def _start_histogram_block_acquisition(self):
+        """Start one synchronized histogram block if no block is active."""
+        if self.histogram_sync is None or self.histogram_block_running:
+            return
 
-        return nominal_rate_hz
+        self.histogram_sync.startFor(self._get_histogram_block_duration_ps(), clear=True)
+        self.histogram_block_running = True
 
     def _normalize_histogram_counts_to_rate(self, counts, start_counts):
         """Convert histogram counts to instantaneous count rate in Hz.
@@ -1488,9 +1484,10 @@ class CoincidenceExample(QMainWindow):
 
         self.correlationAxis.set_yscale('log')
         self.seconds = 1
-        print("histblock depth: ", int(self.ui.IntTime.value()*5))
-        self.histBlock = numpy.zeros((int(self.ui.IntTime.value()*5),self.ui.correlationBins.value() - self.masked_hist_bins))
-        self.histStartCounts = numpy.zeros(int(self.ui.IntTime.value()*5), dtype='float')
+        histblock_depth = self._get_histogram_block_count()
+        print("histblock depth: ", histblock_depth)
+        self.histBlock = numpy.zeros((histblock_depth, self.ui.correlationBins.value() - self.masked_hist_bins))
+        self.histStartCounts = numpy.zeros(histblock_depth, dtype='float')
         self.persistentStartCounts = 0.0
 
         self.buffer = numpy.zeros((1,self.ui.correlationBins.value()))[self.masked_hist_bins:]
@@ -1602,16 +1599,22 @@ class CoincidenceExample(QMainWindow):
         #     self.ui.correlationBinwidth.value(),
         #     self.ui.correlationBins.value())
         
+        self.histogram_sync = SynchronizedMeasurements(self.tagger)
+        histogram_tagger = self.histogram_sync.getTagger()
         self.correlation = Histogram(
-            self.tagger,
+            histogram_tagger,
             self.active_channels[2],
             self.active_channels[0],
             self.ui.correlationBinwidth.value(),
             self.ui.correlationBins.value())
-        self.histogram_start_countrate = Countrate(
-            self.tagger,
+        self.histogram_start_counter = Counter(
+            histogram_tagger,
             [self.active_channels[0]],
+            binwidth=self._get_histogram_block_duration_ps(),
+            n_values=1,
         )
+        self.histogram_block_running = False
+        self._start_histogram_block_acquisition()
 
         self.tagger.sync()
 
@@ -1679,17 +1682,23 @@ class CoincidenceExample(QMainWindow):
         else:
             # else manually start them
             self.counter.start()
-            self.correlation.start()
+            self._start_histogram_block_acquisition()
 
     def stopClicked(self):
         '''Handler for the stop action button'''
         self.running = False
         self.counter.stop()
-        self.correlation.stop()
+        if self.histogram_sync is not None:
+            self.histogram_sync.stop()
+        else:
+            self.correlation.stop()
+        self.histogram_block_running = False
 
     def clearClicked(self):
         '''Handler for the clear action button'''
         self.correlation.clear()
+        if self.histogram_start_counter is not None:
+            self.histogram_start_counter.clear()
 
     
     def saveHistogram(self):
@@ -1719,7 +1728,7 @@ class CoincidenceExample(QMainWindow):
         self.save_filename = filename
         
         print(f"Histogram will be saved to {filename} when data collection is complete.")
-        print(f"Integration depth: {int(self.ui.IntTime.value()*5)} blocks")
+        print(f"Integration depth: {self._get_histogram_block_count()} blocks")
         print("Data collection in progress...")
     
     def _save_histogram_data(self):
@@ -1736,7 +1745,7 @@ class CoincidenceExample(QMainWindow):
                 'x_axis_ps': index.tolist(),  # Convert to list for JSON serialization
                 'histogram_counts': accumulated_data.tolist(),
                 'integration_time_value': self.ui.IntTime.value(),
-                'integration_blocks': int(self.ui.IntTime.value()*5),
+                'integration_blocks': self._get_histogram_block_count(),
                 'binwidth_ps': self.ui.correlationBinwidth.value(),
                 'total_bins': self.ui.correlationBins.value(),
                 'masked_bins': self.masked_hist_bins,
@@ -2791,7 +2800,7 @@ class CoincidenceExample(QMainWindow):
         if self.running:
             # Counter
             #data = self.counter.getData() * self.getCouterNormalizationFactor()
-            histblock_depth = int(self.ui.IntTime.value()*5)
+            histblock_depth = self._get_histogram_block_count()
             
             if self.BlockIndex >= histblock_depth:
                 # Check if saving was requested and histBlock is now full
@@ -2809,23 +2818,41 @@ class CoincidenceExample(QMainWindow):
             self.counterAxis.relim()
             self.counterAxis.autoscale_view(True, True, True)
 
+            if self.histogram_sync is None:
+                self.canvas.draw()
+                return
+
+            if self.histogram_sync.isRunning():
+                self.canvas.draw()
+                return
+
+            self.histogram_block_running = False
+
 
             index = self.correlation.getIndex()[self.masked_hist_bins:]
-            capture_duration_ps = float(self.correlation.getCaptureDuration())
-            capture_duration_s = capture_duration_ps * 1e-12
+            start_counts = 0.0
             try:
-                if self.histogram_start_countrate is not None:
-                    start_capture_duration_ps = float(self.histogram_start_countrate.getCaptureDuration())
-                    if start_capture_duration_ps > 0:
-                        capture_duration_s = start_capture_duration_ps * 1e-12
+                if self.histogram_start_counter is not None:
+                    start_data = self.histogram_start_counter.getData()
+                    start_counts = float(start_data[0][0])
             except Exception:
-                pass
+                start_counts = 0.0
 
-            start_rate_hz = self._get_histogram_start_rate_hz()
-            start_counts = max(0.0, start_rate_hz * capture_duration_s)
+            block_duration_s = self.histogram_block_duration_ms / 1000.0
+            measured_start_rate_hz = 0.0
+            if block_duration_s > 0:
+                measured_start_rate_hz = start_counts / block_duration_s
+            if self.active_channels:
+                print(
+                    f"Measured start rate on channel {self.active_channels[0]}: "
+                    f"{measured_start_rate_hz:.3f} Hz "
+                    f"({start_counts:.0f} starts in {block_duration_s:.3f} s block)"
+                )
 
             q = self.correlation.getData()[self.masked_hist_bins:]
             self.histBlock[self.BlockIndex] = q
+            if self.histStartCounts is None:
+                self.histStartCounts = numpy.zeros(histblock_depth, dtype='float')
             self.histStartCounts[self.BlockIndex] = start_counts
             #print(numpy.sum(q))
 
@@ -2867,11 +2894,9 @@ class CoincidenceExample(QMainWindow):
             #self.correlationAxis.legend(['measured correlation', '$\mu$=%.1fps, $\sigma$=%.1fps' % (
             #    offset, stdd), 'coincidence window'])
             self.canvas.draw()
-            self.correlation.clear()
-            if self.histogram_start_countrate is not None:
-                self.histogram_start_countrate.clear()
 
             self.BlockIndex = self.BlockIndex + 1
+            self._start_histogram_block_acquisition()
 
 
     
