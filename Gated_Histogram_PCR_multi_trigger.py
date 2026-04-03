@@ -36,7 +36,7 @@ from matplotlib.colors import LogNorm
 import yaml
 
 # all required TimeTagger dependencies
-from TimeTagger import Coincidences, Histogram2D, Counter, Correlation, createTimeTagger, freeTimeTagger, Histogram, FileWriter, FileReader, TT_CHANNEL_FALLING_EDGES, Resolution, DelayedChannel, GatedChannel, Countrate, CHANNEL_UNUSED, SynchronizedMeasurements
+from TimeTagger import Coincidences, Histogram2D, Counter, Correlation, StartStop, createTimeTagger, freeTimeTagger, Histogram, FileWriter, FileReader, TT_CHANNEL_FALLING_EDGES, Resolution, DelayedChannel, GatedChannel, Countrate, CHANNEL_UNUSED, SynchronizedMeasurements
 from time import sleep
 import time
 
@@ -1128,6 +1128,10 @@ class CoincidenceExample(QMainWindow):
         self.ui.clearButton.clicked.connect(self.open_keysight33622A_control)
         self.ui.saveButton.clicked.connect(self.saveHistogram)
         self.ui.powerRampButton.clicked.connect(self.power_ramp)
+        self.interarrival_button = QPushButton("Interarrival Corr")
+        self.interarrival_button.setCheckable(True)
+        self.interarrival_button.toggled.connect(self.toggle_interarrival_view)
+        self.ui.horizontalLayout_2.addWidget(self.interarrival_button)
         # self.ui.saveTagsButton.clicked.connect(self.saveTagsSimple)
         # self.ui.TraceGen.clicked.connect(self.saveTrace)
 
@@ -1177,6 +1181,11 @@ class CoincidenceExample(QMainWindow):
         self.ui.plotLayout.addWidget(self.canvas)
 
         self.masked_hist_bins = 2
+        self.plot_mode = 'histogram'
+        self.special_corr = None
+        self.special_corr_start = None
+        self.special_corr_delay_ps = 100
+        self.plt_correlation = []
 
 
         # phd_style(jupyterStyle=True, data_width=1)
@@ -1390,6 +1399,128 @@ class CoincidenceExample(QMainWindow):
         # normalize 'clicks / bin' to 'kclicks / second'
         return 1e12 / bin_index[1] / 1e3
 
+    def toggle_interarrival_view(self, checked):
+        """Toggle the lower plot between histogram and interarrival correlation."""
+        self.plot_mode = 'special_correlation' if checked else 'histogram'
+        self.interarrival_button.setText("Main Histogram" if checked else "Interarrival Corr")
+        self._initialize_correlation_plot()
+        self.draw()
+
+    def _apply_correlation_axis_format(self, title, ylabel):
+        """Apply common formatting to the lower correlation axis."""
+        if self.plot_mode == 'special_correlation' or self.ui.LogScaleCheck.isChecked():
+            self.correlationAxis.set_yscale('log')
+        else:
+            self.correlationAxis.set_yscale('linear')
+        self.correlationAxis.set_xlabel('time (ns)')
+        self.correlationAxis.set_ylabel(ylabel)
+        self.correlationAxis.set_title(title)
+        self.correlationAxis.grid(True)
+
+    def _initialize_correlation_plot(self):
+        """Initialize the lower plot for the currently selected view mode."""
+        self.correlationAxis.clear()
+
+        if self.plot_mode == 'special_correlation' and self.special_corr is not None:
+            index, data = self._get_special_corr_plot_data()
+            display_data = self._get_special_corr_display_data(data)
+            self.plt_correlation = self.correlationAxis.plot(index * 1e-3, display_data, drawstyle='steps-mid')
+            self._apply_correlation_axis_format(
+                'Interarrival Histogram of filtered_on',
+                'Counts',
+            )
+            self._autoscale_special_correlation_axis(index, data)
+        elif hasattr(self, 'correlation') and self.correlation is not None:
+            index = self.correlation.getIndex()[self.masked_hist_bins:]
+            data = self._normalize_histogram_counts_to_rate(
+                self.correlation.getData()[self.masked_hist_bins:],
+                start_counts=0.0,
+            )
+            self.plt_correlation = self.correlationAxis.plot(index * 1e-3, data)
+            self._apply_correlation_axis_format(
+                'Histogram between A and B',
+                'Instantaneous Count Rate (Hz)',
+            )
+        else:
+            self.plt_correlation = self.correlationAxis.plot([], [])
+            self._apply_correlation_axis_format('Correlation', 'Counts')
+
+        self.fig.tight_layout()
+
+    def _get_special_corr_plot_data(self):
+        """Return StartStop data on a dense grid that respects the current bin width."""
+        if self.special_corr is None:
+            return numpy.asarray([], dtype=float), numpy.asarray([], dtype=float)
+
+        raw_data = numpy.asarray(self.special_corr.getData(), dtype=float)
+        if raw_data.size == 0:
+            return numpy.asarray([], dtype=float), numpy.asarray([], dtype=float)
+
+        raw_data = numpy.atleast_2d(raw_data)
+        if raw_data.shape[1] < 2:
+            return numpy.asarray([], dtype=float), numpy.asarray([], dtype=float)
+
+        binwidth_ps = max(1, int(self.ui.correlationBinwidth.value()))
+        n_bins = max(1, int(self.ui.correlationBins.value()))
+        raw_times_ps = numpy.asarray(raw_data[:, 0], dtype=float) + float(self.special_corr_delay_ps)
+        raw_counts = numpy.asarray(raw_data[:, 1], dtype=float)
+
+        valid = numpy.isfinite(raw_times_ps) & numpy.isfinite(raw_counts) & (raw_counts > 0)
+        if not numpy.any(valid):
+            return numpy.asarray([], dtype=float), numpy.asarray([], dtype=float)
+
+        raw_times_ps = raw_times_ps[valid]
+        raw_counts = raw_counts[valid]
+
+        bin_indices = numpy.rint(raw_times_ps / float(binwidth_ps)).astype(int)
+        valid_bins = (bin_indices >= 0) & (bin_indices < n_bins)
+        if not numpy.any(valid_bins):
+            dense_times_ps = numpy.arange(n_bins, dtype=float) * float(binwidth_ps)
+            dense_counts = numpy.zeros(n_bins, dtype=float)
+            return dense_times_ps, dense_counts
+
+        bin_indices = bin_indices[valid_bins]
+        raw_counts = raw_counts[valid_bins]
+
+        dense_counts = numpy.zeros(n_bins, dtype=float)
+        numpy.add.at(dense_counts, bin_indices, raw_counts)
+        dense_times_ps = numpy.arange(n_bins, dtype=float) * float(binwidth_ps)
+
+        return dense_times_ps, dense_counts
+
+    def _get_special_corr_display_data(self, data):
+        """Return special-correlation y-data formatted for plotting on log axes."""
+        display_data = numpy.asarray(data, dtype=float).copy()
+        display_data[display_data <= 0] = numpy.nan
+        return display_data
+
+    def _autoscale_special_correlation_axis(self, index, data):
+        """Autoscale the special-correlation axis, including the empty-data case."""
+        binwidth_ns = max(float(self.ui.correlationBinwidth.value()) * 1e-3, 1e-6)
+        n_bins = max(1, int(self.ui.correlationBins.value()))
+        self.correlationAxis.set_xlim(0.0, n_bins * binwidth_ns)
+
+        if index.size == 0 or data.size == 0 or not numpy.any(numpy.isfinite(data)):
+            self.correlationAxis.set_ylim(0.0, 1.0)
+            return
+
+        finite_data = numpy.asarray(data, dtype=float)
+        finite_data = finite_data[numpy.isfinite(finite_data)]
+        if finite_data.size == 0:
+            self.correlationAxis.set_ylim(0.0, 1.0)
+            return
+
+        max_y = float(numpy.max(finite_data))
+        positive = finite_data[finite_data > 0]
+        if self.plot_mode == 'special_correlation' or self.ui.LogScaleCheck.isChecked():
+            if positive.size == 0:
+                self.correlationAxis.set_ylim(0.5, 1.0)
+            else:
+                min_y = float(numpy.min(positive))
+                self.correlationAxis.set_ylim(max(min_y * 0.8, 1e-12), max(max_y * 1.2, min_y * 2.0))
+        else:
+            self.correlationAxis.set_ylim(0.0, max(1.0, max_y * 1.05))
+
     def _get_histogram_block_duration_ps(self):
         """Return the live histogram block duration in ps."""
         return int(self.histogram_block_duration_ms * 1e9)
@@ -1439,6 +1570,9 @@ class CoincidenceExample(QMainWindow):
     def updateMeasurements(self):
         '''Create/Update all TimeTagger measurement objects'''
 
+        # Always reload YAML parameters so gating settings update immediately.
+        self.load_params()
+
         # If any configuration is changed while the measurements are stopped, recreate them on the start button
         if not self.running:
             self.measurements_dirty = True
@@ -1482,7 +1616,7 @@ class CoincidenceExample(QMainWindow):
             self.tagger.setDeadtime(channels[3]*-1, int(self.ui.deadTimeD.value() * 1000))
             self.active_channels.append(channels[3])
 
-        self.correlationAxis.set_yscale('log')
+        self.correlationAxis.set_yscale('log' if self.ui.LogScaleCheck.isChecked() else 'linear')
         self.seconds = 1
         histblock_depth = self._get_histogram_block_count()
         print("histblock depth: ", histblock_depth)
@@ -1560,6 +1694,14 @@ class CoincidenceExample(QMainWindow):
         # thermal source off
         self.filtered_off = GatedChannel(self.tagger, self.active_channels[2], self.delay_2_start.getChannel(), self.delay_2_stop.getChannel())
 
+        # Create a slightly delayed copy of filtered_on so StartStop does not
+        # pair each event with itself at t = 0.
+        self.special_corr_start = DelayedChannel(
+            self.tagger,
+            self.filtered_on.getChannel(),
+            self.special_corr_delay_ps,
+        )
+
 
 
         # Only recreate the counter if its parameter has changed,
@@ -1607,6 +1749,12 @@ class CoincidenceExample(QMainWindow):
             self.active_channels[0],
             self.ui.correlationBinwidth.value(),
             self.ui.correlationBins.value())
+        self.special_corr = StartStop(
+            self.tagger,
+            self.filtered_on.getChannel(),
+            self.special_corr_start.getChannel(),
+            self.ui.correlationBinwidth.value(),
+        )
         self.histogram_start_counter = Counter(
             histogram_tagger,
             [self.active_channels[0]],
@@ -1641,24 +1789,7 @@ class CoincidenceExample(QMainWindow):
         # self.counterAxis.legend(['A', 'B', 'C', 'D','coincidences'])
         self.counterAxis.grid(True)
 
-        self.correlationAxis.clear()
-        index = self.correlation.getIndex()[self.masked_hist_bins:]
-        #data = self.correlation.getDataNormalized()
-        data = self._normalize_histogram_counts_to_rate(
-            self.correlation.getData()[self.masked_hist_bins:],
-            start_counts=0.0,
-        )
-        self.plt_correlation = self.correlationAxis.plot(
-            index * 1e-3,
-            data
-        )
-
-
-
-        self.correlationAxis.set_xlabel('time (ns)')
-        self.correlationAxis.set_ylabel('Instantaneous Count Rate (Hz)')
-        self.correlationAxis.set_title('Histogram between A and B')
-        self.correlationAxis.grid(True)
+        self._initialize_correlation_plot()
 
         # Generate nicer plots
         self.fig.tight_layout()
@@ -1682,12 +1813,22 @@ class CoincidenceExample(QMainWindow):
         else:
             # else manually start them
             self.counter.start()
+            if self.special_corr is not None:
+                try:
+                    self.special_corr.start()
+                except Exception:
+                    pass
             self._start_histogram_block_acquisition()
 
     def stopClicked(self):
         '''Handler for the stop action button'''
         self.running = False
         self.counter.stop()
+        if self.special_corr is not None:
+            try:
+                self.special_corr.stop()
+            except Exception:
+                pass
         if self.histogram_sync is not None:
             self.histogram_sync.stop()
         else:
@@ -1697,66 +1838,104 @@ class CoincidenceExample(QMainWindow):
     def clearClicked(self):
         '''Handler for the clear action button'''
         self.correlation.clear()
+        if self.special_corr is not None:
+            try:
+                self.special_corr.clear()
+            except Exception:
+                pass
         if self.histogram_start_counter is not None:
             self.histogram_start_counter.clear()
 
-    
-    def saveHistogram(self):
-        """Set up saving histogram data when histBlock is full"""
-        from PySide2.QtWidgets import QFileDialog
-        
-        # Get save location using file dialog
+    def _prompt_histogram_save_filename(self):
+        """Prompt the user for a JSON filename for histogram export."""
         filename, _ = QFileDialog().getSaveFileName(
             parent=self,
             caption='Save Histogram Data',
-            directory='histogram_data.json',  # default name
+            directory='histogram_data.json',
             filter='JSON Files (*.json);;All Files (*)',
             options=QFileDialog.DontUseNativeDialog
         )
-        
-        # If user cancels, exit the function
+
         if not filename:
             print("Save operation cancelled.")
-            return
-        
-        # Ensure we have a .json extension
+            return None
+
         if not filename.lower().endswith('.json'):
             filename += '.json'
-        
-        # Set the flag to start saving when histBlock is full
+
+        return filename
+
+    
+    def saveHistogram(self):
+        """Save the currently active lower-plot data as JSON."""
+        filename = self._prompt_histogram_save_filename()
+        if filename is None:
+            return
+
+        if self.plot_mode == 'special_correlation':
+            self._save_special_correlation_data(filename)
+            return
+
         self.save_requested = True
         self.save_filename = filename
-        
+
         print(f"Histogram will be saved to {filename} when data collection is complete.")
         print(f"Integration depth: {self._get_histogram_block_count()} blocks")
         print("Data collection in progress...")
     
-    def _save_histogram_data(self):
-        """Internal method to save the accumulated histogram data"""
+    def _save_histogram_data(self, filename=None):
+        """Internal method to save the accumulated standard histogram data."""
         try:
+            target_filename = filename if filename is not None else self.save_filename
+            if not target_filename:
+                print("Error saving histogram data: no target filename set")
+                return
+
             # Get the accumulated data (sum of histBlock)
             accumulated_data = numpy.sum(self.histBlock, axis=0)
+            total_start_counts = float(numpy.sum(self.histStartCounts)) if self.histStartCounts is not None else 0.0
+            normalized_rate_hz = self._normalize_histogram_counts_to_rate(
+                accumulated_data,
+                total_start_counts,
+            )
             
             # Get the x-axis data (index)
             index = self.correlation.getIndex()[self.masked_hist_bins:]
             
             # Prepare data for JSON export
             data_dict = {
+                'data_columns': [
+                    'x_axis_ps',
+                    'histogram_counts',
+                    'instantaneous_count_rate_hz',
+                ],
                 'x_axis_ps': index.tolist(),  # Convert to list for JSON serialization
                 'histogram_counts': accumulated_data.tolist(),
+                'instantaneous_count_rate_hz': normalized_rate_hz.tolist(),
                 'integration_time_value': self.ui.IntTime.value(),
                 'integration_blocks': self._get_histogram_block_count(),
+                'histogram_block_duration_ms': self.histogram_block_duration_ms,
+                'histogram_start_counts_per_block': self.histStartCounts.tolist() if self.histStartCounts is not None else [],
+                'histogram_total_start_counts': total_start_counts,
                 'binwidth_ps': self.ui.correlationBinwidth.value(),
                 'total_bins': self.ui.correlationBins.value(),
                 'masked_bins': self.masked_hist_bins,
+                'y_axis_units': 'Hz',
+                'plot_mode': 'histogram',
+                'measurement_class': 'Histogram',
+                'y_axis_normalization': {
+                    'description': 'Per-start instantaneous count rate used by the live GUI histogram',
+                    'formula': 'rate_hz = histogram_counts / (histogram_total_start_counts * binwidth_seconds)',
+                    'start_channel': self.active_channels[0] if self.active_channels else None,
+                },
                 'timestamp': str(numpy.datetime64('now'))
             }
             
             # Save to JSON file
-            with open(self.save_filename, 'w') as file:
+            with open(target_filename, 'w') as file:
                 json.dump(data_dict, file, indent=2)
             
-            print(f"Histogram data successfully saved to: {self.save_filename}")
+            print(f"Histogram data successfully saved to: {target_filename}")
             print(f"Total counts in histogram: {numpy.sum(accumulated_data)}")
             
         except Exception as e:
@@ -1765,6 +1944,63 @@ class CoincidenceExample(QMainWindow):
             # Reset the save flag
             self.save_requested = False
             self.save_filename = None
+
+    def _save_special_correlation_data(self, filename):
+        """Save the StartStop special-correlation data immediately as JSON."""
+        try:
+            if self.special_corr is None:
+                print("Error saving special correlation data: measurement not initialized")
+                return
+
+            raw_data = numpy.asarray(self.special_corr.getData(), dtype=float)
+            raw_data = numpy.atleast_2d(raw_data) if raw_data.size else numpy.empty((0, 2), dtype=float)
+            if raw_data.shape[1] < 2:
+                raw_data = numpy.empty((0, 2), dtype=float)
+
+            raw_times_minus_delay_ps = raw_data[:, 0].tolist()
+            raw_times_ps = (raw_data[:, 0] + float(self.special_corr_delay_ps)).tolist()
+            raw_counts = raw_data[:, 1].tolist()
+
+            display_x_ps, display_counts = self._get_special_corr_plot_data()
+            display_counts_semilog = self._get_special_corr_display_data(display_counts)
+
+            data_dict = {
+                'plot_mode': 'special_correlation',
+                'measurement_class': 'StartStop',
+                'data_columns': [
+                    'display_x_axis_ps',
+                    'display_counts',
+                    'display_counts_semilog',
+                ],
+                'raw_sparse_columns': [
+                    'time_ps_minus_delay_correction',
+                    'time_ps',
+                    'counts',
+                ],
+                'raw_sparse_time_ps_minus_delay_correction': raw_times_minus_delay_ps,
+                'raw_sparse_time_ps': raw_times_ps,
+                'raw_sparse_counts': raw_counts,
+                'display_x_axis_ps': display_x_ps.tolist(),
+                'display_counts': display_counts.tolist(),
+                'display_counts_semilog': display_counts_semilog.tolist(),
+                'binwidth_ps': int(self.ui.correlationBinwidth.value()),
+                'display_total_bins': int(self.ui.correlationBins.value()),
+                'special_corr_delay_ps': float(self.special_corr_delay_ps),
+                'y_axis_units': 'counts',
+                'y_axis_scale_for_display': 'log',
+                'active_channels': list(self.active_channels),
+                'filtered_on_channel': self.filtered_on.getChannel() if hasattr(self, 'filtered_on') else None,
+                'special_corr_start_channel': self.special_corr_start.getChannel() if self.special_corr_start is not None else None,
+                'timestamp': str(numpy.datetime64('now')),
+            }
+
+            with open(filename, 'w') as file:
+                json.dump(data_dict, file, indent=2)
+
+            print(f"Special correlation data successfully saved to: {filename}")
+            print(f"Non-empty StartStop bins saved: {len(raw_counts)}")
+        except Exception as e:
+            print(f"Error saving special correlation data: {e}")
     
     # def saveHistogram(self):
 
@@ -2818,85 +3054,87 @@ class CoincidenceExample(QMainWindow):
             self.counterAxis.relim()
             self.counterAxis.autoscale_view(True, True, True)
 
-            if self.histogram_sync is None:
-                self.canvas.draw()
-                return
+            current_hist_index = None
+            current_hist_data = None
 
-            if self.histogram_sync.isRunning():
-                self.canvas.draw()
-                return
+            if self.histogram_sync is not None and not self.histogram_sync.isRunning():
+                self.histogram_block_running = False
 
-            self.histogram_block_running = False
-
-
-            index = self.correlation.getIndex()[self.masked_hist_bins:]
-            start_counts = 0.0
-            try:
-                if self.histogram_start_counter is not None:
-                    start_data = self.histogram_start_counter.getData()
-                    start_counts = float(start_data[0][0])
-            except Exception:
+                current_hist_index = self.correlation.getIndex()[self.masked_hist_bins:]
                 start_counts = 0.0
+                try:
+                    if self.histogram_start_counter is not None:
+                        start_data = self.histogram_start_counter.getData()
+                        start_counts = float(start_data[0][0])
+                except Exception:
+                    start_counts = 0.0
 
-            block_duration_s = self.histogram_block_duration_ms / 1000.0
-            measured_start_rate_hz = 0.0
-            if block_duration_s > 0:
-                measured_start_rate_hz = start_counts / block_duration_s
-            if self.active_channels:
-                print(
-                    f"Measured start rate on channel {self.active_channels[0]}: "
-                    f"{measured_start_rate_hz:.3f} Hz "
-                    f"({start_counts:.0f} starts in {block_duration_s:.3f} s block)"
-                )
+                block_duration_s = self.histogram_block_duration_ms / 1000.0
+                measured_start_rate_hz = 0.0
+                if block_duration_s > 0:
+                    measured_start_rate_hz = start_counts / block_duration_s
+                # if self.active_channels:
+                #     print(
+                #         f"Measured start rate on channel {self.active_channels[0]}: "
+                #         f"{measured_start_rate_hz:.3f} Hz "
+                #         f"({start_counts:.0f} starts in {block_duration_s:.3f} s block)"
+                #     )
 
-            q = self.correlation.getData()[self.masked_hist_bins:]
-            self.histBlock[self.BlockIndex] = q
-            if self.histStartCounts is None:
-                self.histStartCounts = numpy.zeros(histblock_depth, dtype='float')
-            self.histStartCounts[self.BlockIndex] = start_counts
-            #print(numpy.sum(q))
+                q = self.correlation.getData()[self.masked_hist_bins:]
+                self.histBlock[self.BlockIndex] = q
+                if self.histStartCounts is None:
+                    self.histStartCounts = numpy.zeros(histblock_depth, dtype='float')
+                self.histStartCounts[self.BlockIndex] = start_counts
 
-            if self.ui.IntType.currentText() == "Discrete":
-                if self.BlockIndex == 0:
-                    self.persistentData = numpy.sum(self.histBlock, axis=0)
-                    self.persistentStartCounts = float(numpy.sum(self.histStartCounts))
-                else:
-                    if self.IntType == "Rolling":
-
-                        # first time changing from Rolling to Discrete
+                if self.ui.IntType.currentText() == "Discrete":
+                    if self.BlockIndex == 0:
                         self.persistentData = numpy.sum(self.histBlock, axis=0)
                         self.persistentStartCounts = float(numpy.sum(self.histStartCounts))
-                        self.BlockIndex = 1
-                        self.IntType = "Discrete"
-                currentCounts = self.persistentData
-                currentStartCounts = self.persistentStartCounts
-            else:
+                    else:
+                        if self.IntType == "Rolling":
+                            self.persistentData = numpy.sum(self.histBlock, axis=0)
+                            self.persistentStartCounts = float(numpy.sum(self.histStartCounts))
+                            self.BlockIndex = 1
+                            self.IntType = "Discrete"
+                    currentCounts = self.persistentData
+                    currentStartCounts = self.persistentStartCounts
+                else:
                     currentCounts = numpy.sum(self.histBlock, axis=0)
                     currentStartCounts = float(numpy.sum(self.histStartCounts))
-            #print(numpy.sum(currentData))
-            self.IntType = self.ui.IntType.currentText()
+                self.IntType = self.ui.IntType.currentText()
 
-            currentData = self._normalize_histogram_counts_to_rate(
-                currentCounts,
-                currentStartCounts,
-            )
+                current_hist_data = self._normalize_histogram_counts_to_rate(
+                    currentCounts,
+                    currentStartCounts,
+                )
+                current_hist_data = self.remove_peak(current_hist_data, index=current_hist_index)
 
-            # remove giant peak at zero delay for better visualization
-            currentData = self.remove_peak(currentData, index=index)
-            # display data averaged for one second
-            self.plt_correlation[0].set_ydata(currentData)
-            #self.plt_gauss[0].set_ydata(gauss)
-            self.correlationAxis.relim()
-            self.correlationAxis.set_ylabel('Instantaneous Count Rate (Hz)')
-            #if self.BlockIndex == 0:
-            self.correlationAxis.autoscale_view(True, True, True)
-                #self.correlation.clear()
-            #self.correlationAxis.legend(['measured correlation', '$\mu$=%.1fps, $\sigma$=%.1fps' % (
-            #    offset, stdd), 'coincidence window'])
+                self.BlockIndex = self.BlockIndex + 1
+                self._start_histogram_block_acquisition()
+
+            if not self.plt_correlation:
+                self._initialize_correlation_plot()
+
+            if self.plot_mode == 'special_correlation' and self.special_corr is not None:
+                special_index, special_data = self._get_special_corr_plot_data()
+                self.plt_correlation[0].set_xdata(special_index * 1e-3)
+                self.plt_correlation[0].set_ydata(self._get_special_corr_display_data(special_data))
+                self._apply_correlation_axis_format(
+                    'Interarrival Histogram of filtered_on',
+                    'Counts',
+                )
+                self._autoscale_special_correlation_axis(special_index, special_data)
+            elif current_hist_data is not None and current_hist_index is not None:
+                self.plt_correlation[0].set_xdata(current_hist_index * 1e-3)
+                self.plt_correlation[0].set_ydata(current_hist_data)
+                self.correlationAxis.relim()
+                self._apply_correlation_axis_format(
+                    'Histogram between A and B',
+                    'Instantaneous Count Rate (Hz)',
+                )
+                self.correlationAxis.autoscale_view(True, True, True)
+
             self.canvas.draw()
-
-            self.BlockIndex = self.BlockIndex + 1
-            self._start_histogram_block_acquisition()
 
 
     

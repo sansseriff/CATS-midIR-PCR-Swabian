@@ -1,9 +1,9 @@
 voltage:
-  start: 0.004 # 0.004 0.14 # 0.010 # 0.08
-  stop: 0.125 # 0.110 # 825 # 0.21 # 0.30
+  start: 0.035 # 0.004 0.14 # 0.010 # 0.08
+  stop: 0.100 # 0.110 # 825 # 0.21 # 0.30
   step: 0.002
-integration_time: 4
-cycles: 1  # Number of full bias sweeps. Counts are averaged across cycles.
+integration_time: 14
+cycles: 8  # Number of full bias sweeps. Counts are averaged across cycles.
 turn_off_after_pcr:
   cryo_amp: true
   thermal_source: true
@@ -12,7 +12,7 @@ turn_off_after_pcr:
 # Mode toggle: "thermal_source" or "qcl"
 mode: "qcl" #"thermal_source"
 
-pulse_rep_rate: 40 # should be 1 in thermal source mode
+pulse_rep_rate: 45 # should be 1 in thermal source mode
 
 # Gating delays in milliseconds (multiplied by 1e9 in the code to get ps)
 gating_delays:
@@ -24,10 +24,10 @@ gating_delays:
     off_start: 450
     off_stop: 950
   qcl:
-    on_start: 0.100 #0.100  QCL 46um
-    on_stop: 0.120 #0.290  QCL 46um
-    on_dcr_start: 0.300
-    on_dcr_stop: 0.400
+    on_start: 0.030 #0.100  QCL 46um
+    on_stop: 0.245 #0.290  QCL 46um
+    on_dcr_start: 0.246
+    on_dcr_stop: 0.247
     off_start: 0.600  # 160 microseconds
     off_stop: 30 #0.340  
 
@@ -39,13 +39,13 @@ filtered_PCR:
   trigger_levels:
     # - "0.006"
     # - "0.007"
-    - "0.008"
+    # - "0.008"
     # - "0.009"
     - "0.010"
     # - "0.011"
     - "0.012"
     # - "0.013"
-    # - "0.014"
+    - "0.014"
     # - "0.015"
     # - "0.016"
     # - "0.017"
