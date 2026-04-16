@@ -2739,10 +2739,24 @@ class CoincidenceExample(QMainWindow):
             ax.grid(True)
             ax.legend(loc='best', fancybox=False)
             fig.tight_layout()
+
+            # Pause the live-update timer while this window is open so its
+            # 50ms draw callbacks don't compete with the save dialog.
+            self.timer.stop()
+
+            def _on_pcr_fig_close(event):
+                if self.running:
+                    self.timer.start(self.draw_timer_interval_ms)
+
+            fig.canvas.mpl_connect('close_event', _on_pcr_fig_close)
+
             # Blocking window the user can zoom/pan and save from.
             plt.show()
         except Exception as e:
             print(f"Error showing final PCR plot window: {e}")
+            # Make sure the timer is always restarted even if something goes wrong.
+            if not self.timer.isActive() and self.running:
+                self.timer.start(self.draw_timer_interval_ms)
 
         time.sleep(0.5)
 
@@ -3134,10 +3148,10 @@ class CoincidenceExample(QMainWindow):
                 )
                 self.correlationAxis.autoscale_view(True, True, True)
 
-            self.canvas.draw()
+            self.canvas.draw_idle()
 
 
-    
+
 
 
 # If this file is executed, initialize PySide2, create a TimeTagger object, and show the UI
