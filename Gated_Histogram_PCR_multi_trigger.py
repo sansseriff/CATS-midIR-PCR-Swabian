@@ -8,6 +8,7 @@ from PySide2.QtGui import QPalette, QColor
 from snsphd.viz import phd_grid_style
 
 from snspd_measure.inst.sim900 import sim928
+from snspd_measure.inst.hp8114A import hp8114A
 
 # Import client instruments
 from client_keysight33622A import ClientKeysight33622A
@@ -2252,6 +2253,20 @@ class CoincidenceExample(QMainWindow):
                         print("Function generator not available for thermal source shutdown")
                 except Exception as e:
                     print(f"Error turning off thermal source: {e}")
+
+
+            if shutdown_config.get('qcl', False):
+                try:
+                
+                    self.qcl = hp8114A("/dev/ttyUSB1", 10)
+                    self.qcl.connect()
+                    time.sleep(0.1)
+                    self.qcl.setOutput(0) 
+                    time.sleep(0.1)
+                    self.qcl.disconnect()
+
+                except Exception as e:
+                    print(f"Error turning off QCL: {e}")
                     
         except Exception as e:
             print(f"Error in instrument shutdown: {e}")
@@ -2292,6 +2307,18 @@ class CoincidenceExample(QMainWindow):
                     print("Function generator not available for thermal source shutdown")
             except Exception as e:
                 print(f"Error turning off thermal source: {e}")
+
+
+            # turn off hp8114A pulse generator (QCL)
+            try:
+                self.qcl = hp8114A("/dev/ttyUSB1", 10)
+                self.qcl.connect()
+                time.sleep(0.1)
+                self.qcl.setOutput(0) 
+                time.sleep(0.1)
+                self.qcl.disconnect()
+            except Exception as e:
+                print(f"Error turning off QCL: {e}")
                     
         except Exception as e:
             print(f"Error in instrument shutdown: {e}")
@@ -2472,7 +2499,7 @@ class CoincidenceExample(QMainWindow):
                 if Counts_on_dcr is not None:
                     y_on_dcr = np.array(Counts_on_dcr[j], dtype=float)
                     valid_on_dcr = y_on_dcr[valid]
-                    ax.plot(valid_x, valid_on_dcr, color=color, marker='s', markersize=3, linestyle='-.', label=f'TL {j+1} on_dcr')
+                    ax.plot(valid_x, valid_on_dcr, color=color, marker='s', markersize=3, linestyle='-.', label=f'TL {j+1} on_dcr', alpha=0.1)
 
                 if Counts_off is not None:
                     y_dark = np.array(Counts_off[j], dtype=float)
@@ -2709,7 +2736,7 @@ class CoincidenceExample(QMainWindow):
                     if Counts_on_dcr is not None:
                         y_on_dcr = np.array(Counts_on_dcr[j], dtype=float)
                         valid_on_dcr = y_on_dcr[valid]
-                        ax.plot(valid_x, valid_on_dcr, color=color, marker='s', markersize=3, linestyle='-.', label=f'TL {j+1} on_dcr')
+                        ax.plot(valid_x, valid_on_dcr, color=color, marker='s', markersize=3, linestyle='-.', label=f'TL {j+1} on_dcr', alpha=0.1)
 
                     if Counts_off is not None:
                         y_dark = np.array(Counts_off[j], dtype=float)
@@ -3134,7 +3161,7 @@ class CoincidenceExample(QMainWindow):
                 )
                 self.correlationAxis.autoscale_view(True, True, True)
 
-            self.canvas.draw()
+            self.canvas.draw_idle()
 
 
     

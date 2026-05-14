@@ -1,37 +1,38 @@
 voltage:
-  start: 0.035 # 0.004 0.14 # 0.010 # 0.08
-  stop: 0.100 # 0.110 # 825 # 0.21 # 0.30
-  step: 0.002
-integration_time: 14
-cycles: 8  # Number of full bias sweeps. Counts are averaged across cycles.
+  start: 0.2 # 0.004 0.14 # 0.010 # 0.08
+  stop: 0.60 # 0.110 # 825 # 0.21 # 0.30
+  step: 0.005
+integration_time: 1
+cycles: 25  # Number of full bias sweeps. Counts are averaged across cycles.
 turn_off_after_pcr:
   cryo_amp: true
   thermal_source: true
   sim928: true
+  qcl: true
 
 # Mode toggle: "thermal_source" or "qcl"
-mode: "qcl" #"thermal_source"
+mode: "thermal_source" #"thermal_source"
 
-pulse_rep_rate: 45 # should be 1 in thermal source mode
+pulse_rep_rate: 1 # should be 1 in thermal source mode
 
 # Gating delays in milliseconds (multiplied by 1e9 in the code to get ps)
 gating_delays:
   thermal_source:
     on_start: 30
-    on_stop: 270
-    on_dcr_start: 270
-    on_dcr_stop: 450
+    on_stop: 180
+    on_dcr_start: 271
+    on_dcr_stop: 272
     off_start: 450
     off_stop: 950
   qcl:
-    on_start: 0.030 #0.100  QCL 46um
-    on_stop: 0.245 #0.290  QCL 46um
-    on_dcr_start: 0.246
-    on_dcr_stop: 0.247
-    off_start: 0.600  # 160 microseconds
-    off_stop: 30 #0.340  
+    on_start: 0.1 #0.004 #0.010 # 0.050 #00.030  QCL 46um
+    on_stop: 0.95 #0.023 #0.048 #0.245  QCL 46um
+    on_dcr_start: 1.2 #0.048 #0.246  QCL 46um
+    on_dcr_stop: 1.2 #0.048 #0.247  QCL 46um
+    off_start: 1.2 #0.120 #0.600  QCL 46um
+    off_stop: 15 #2 #30  QCL 46um 
 
-measurement_type: "filtered_pcr" # options are 'filtered_pcr' or 'dcr'
+measurement_type: "filtered_PCR" # options are 'filtered_pcr' or 'dcr'
 
 fudge_factor: 1  # Adjust this factor to calibrate the ratio_on value
 
@@ -41,17 +42,17 @@ filtered_PCR:
     # - "0.007"
     # - "0.008"
     # - "0.009"
-    - "0.010"
+    # - "0.010"
     # - "0.011"
-    - "0.012"
+    # - "0.012"
     # - "0.013"
-    - "0.014"
+    # - "0.014"
     # - "0.015"
-    # - "0.016"
+    # "-0.016"
     # - "0.017"
-    # - "0.018"
+    # - "0.018" 
     # - "0.019"
-    # - "0.020"
+     - "0.020"
     # - "0.021"
     # - "0.022"
     # - "0.023"
@@ -66,7 +67,7 @@ filtered_PCR:
     # - "0.016"
 DCR: 
   trigger_levels:
-    - "-0.017"
-    - "-0.025"
-    - "-0.027"
+    - "0.017"
+    - "0.020"
+    - "0.030"
   # trigger_level: -0.030  # Old single trigger level format (commented out)

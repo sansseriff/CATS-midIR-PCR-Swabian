@@ -2,7 +2,7 @@ Channels:
   ChA:
     channel: 9
     dead_time: 1000000
-    delay: -90000000
+    delay: -90550000
     trigger: 0.1
   ChB:
     channel: 18
@@ -12,8 +12,8 @@ Channels:
   ChC:
     channel: 5
     dead_time: 100
-    delay: -85000000
-    trigger: 0.014
+    delay: 0
+    trigger: 0.016
   ChD:
     channel: 18
     dead_time: 0

@@ -56,7 +56,7 @@ def main() -> None:
 
     # file_path = Path(args.json_file).expanduser().resolve()
 
-    file_path = "/home/cats/Documents/measurements/QCL_testing/4.2.2026/SECTIONHIST__QCL_46_33.4_321_500_30__FRIDGE_262__SAVE_600_0.014_DETECTOR_0.08__WINDOW_0.050_0.200.json"
+    file_path = "/home/cats/Documents/measurements/QCL_testing/4.3.2026/SECTIONHIST__QCL_63_8.39_64.3_500_80__FRIDGE_263__SAVE_180_0.012_DETECTOR_0.08__WINDOW_0.050_0.480.json"
     data = load_interarrival_json(file_path)
 
     x_ps = np.asarray(data["display_x_axis_ps"], dtype=float)
