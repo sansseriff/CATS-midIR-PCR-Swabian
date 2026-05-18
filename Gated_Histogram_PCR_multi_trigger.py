@@ -1,4 +1,4 @@
-# from snspd_measure.inst.keysight33622A import keysight33622A
+# from snspd_measure.inst.teledyneT3AFG200 import teledyneT3AFG200
 
 # PySide2 for the UI
 from PySide2.QtWidgets import QMainWindow, QApplication, QFileDialog, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QDoubleSpinBox, QLabel, QGroupBox, QMessageBox
@@ -11,7 +11,7 @@ from snspd_measure.inst.sim900 import sim928
 from snspd_measure.inst.hp8114A import hp8114A
 
 # Import client instruments
-from client_keysight33622A import ClientKeysight33622A
+from client_teledyneT3AFG200 import ClientTeledyneT3AFG200
 from client_keysightE36312A import ClientKeysightE36312A
 
 # matplotlib for the plots, including its Qt backend
@@ -749,13 +749,13 @@ class SIM928ControlDialog(QDialog):
         else:
             QMessageBox.warning(self, "Error", "SIM928 source not available")
 
-class Keysight33622AControlDialog(QDialog):
-    """Modal dialog for controlling the Keysight 33622A function generator"""
-    
+class TeledyneT3AFG200ControlDialog(QDialog):
+    """Modal dialog for controlling the Teledyne T3AFG200 function generator"""
+
     def __init__(self, parent=None):
-        super(Keysight33622AControlDialog, self).__init__(parent)
+        super(TeledyneT3AFG200ControlDialog, self).__init__(parent)
         self.parent_window = parent
-        self.setWindowTitle("Keysight 33622A Function Generator Control")
+        self.setWindowTitle("Teledyne T3AFG200 Function Generator Control")
         self.setModal(True)
         self.setupUI()
         
@@ -791,7 +791,7 @@ class Keysight33622AControlDialog(QDialog):
         self.setLayout(layout)
         
     def set_high_level(self):
-        """Set the high level on the Keysight 33622A function generator"""
+        """Set the high level on the Teledyne T3AFG200 function generator"""
         high_level = self.level_spinbox.value()
         if self.parent_window and self.parent_window.function_gen:
             try:
@@ -1126,7 +1126,7 @@ class CoincidenceExample(QMainWindow):
         self.ui.setupUi(self)
         self.ui.PCRButton.clicked.connect(self.PCR)
         self.ui.triggerScanButton.clicked.connect(self.open_sim928_control)
-        self.ui.clearButton.clicked.connect(self.open_keysight33622A_control)
+        self.ui.clearButton.clicked.connect(self.open_teledyneT3AFG200_control)
         self.ui.saveButton.clicked.connect(self.saveHistogram)
         self.ui.powerRampButton.clicked.connect(self.power_ramp)
         self.interarrival_button = QPushButton("Interarrival Corr")
@@ -1225,11 +1225,11 @@ class CoincidenceExample(QMainWindow):
                  # You might want to disable the PCR button here
                  # self.ui.PCRButton.setEnabled(False)
 
-        # Initialize Keysight instruments
+        # Initialize function generator (Teledyne T3AFG200) and Keysight PSU
         try:
-            self.function_gen = ClientKeysight33622A()
+            self.function_gen = ClientTeledyneT3AFG200()
             self.function_gen.connect()
-            print("Function generator (33622A) connected successfully")
+            print("Function generator (Teledyne T3AFG200) connected successfully")
         except Exception as e:
             print(f"Failed to connect to function generator: {e}")
             self.function_gen = None
@@ -1361,9 +1361,9 @@ class CoincidenceExample(QMainWindow):
         dialog = SIM928ControlDialog(self)
         dialog.exec_()
 
-    def open_keysight33622A_control(self):
-        """Open the Keysight 33622A control dialog"""
-        dialog = Keysight33622AControlDialog(self)
+    def open_teledyneT3AFG200_control(self):
+        """Open the Teledyne T3AFG200 control dialog"""
+        dialog = TeledyneT3AFG200ControlDialog(self)
         dialog.exec_()
 
     def power_ramp(self):
@@ -2006,7 +2006,7 @@ class CoincidenceExample(QMainWindow):
     # def saveHistogram(self):
 
     #     pass
-        #  wf = keysight33622A('10.7.0.187')
+        #  wf = teledyneT3AFG200('10.7.0.187')
         #  wf.connect()
         #  V_pp = 0.090 #in V 
         #  Start = 0.055
